@@ -1,0 +1,87 @@
+# Run only one instance per bot token.
+
+[telegram]
+token = ""                    # Override with YABOT_TELEGRAM_TOKEN.
+api_server = "https://api.telegram.org" # Plain HTTP is allowed only for localhost or a loopback IP literal.
+poll_timeout = "25s"
+settle_timeout = "5s"
+transient_budget = "2m"
+poison_threshold = 3
+
+[http]
+listen = "127.0.0.1:8080"     # Caddy proxies to this IPv4 loopback address.
+public_base_url = "https://yabot.example.com"
+trusted_proxy_header = "X-Forwarded-For"
+max_inflight = 256
+ip_rps = 20
+ip_burst = 40
+user_rps = 5
+user_burst = 10
+
+[admin]
+listen = "127.0.0.1:9090"     # Keep metrics, profiling, and health endpoints on IPv4 loopback.
+
+[log]
+level = "info"
+format = "json"
+
+[store]
+dir = "/var/lib/yabot"         # Holds the database, lock file, and backups.
+cache_kib = 8000
+checkpoint_interval = "500ms"
+write_queue = 4096
+backup_keep = 7
+
+[dispatch]
+shards = 4
+inbox = 512
+tickets_per_shard = 1024       # shards * tickets_per_shard must fit in store.write_queue.
+mailbox_per_entity = 16
+
+[sender]
+workers = 16
+reserved = { deadline = 6, decision = 4 }
+cap = { interactive = 4, background = 4 }
+global_rps = 25
+global_burst = 5
+class_weights = { deadline = 8, decision = 4, interactive = 2, background = 1 }
+chat_queue = 256
+raid_weight = 0.25
+max_retries = 4
+
+[guard]
+present_budget = "8s"
+backlog_cutoff = "9s"
+max_active_per_chat = 2000
+max_active_total = 100000
+raid_chat_rps = 5
+raid_global_wait = "4s"
+recent_closed_ttl = "10m"
+blacklist = []                # User IDs blocked across all chats.
+
+[turnstile]
+site_key = ""
+secret = ""                   # Override with YABOT_TURNSTILE_SECRET.
+hostname = "yabot.example.com"
+timeout = "3s"
+concurrency = 16
+
+[security]
+# Base64-encoded 32-byte key for cData and the UUIDv5 namespace.
+hmac_key = ""                 # Override with YABOT_HMAC_KEY.
+initdata_max_age = "24h"
+
+[tenant]
+accept_new_chats = true
+idle_leave_after = "168h"
+probe_periodic = "24h"         # How often to check bot status and chat ownership.
+probe_periodic_rps = 0.2
+
+[retention]
+guard_history = "720h"
+settings_audit = "2160h"
+dead_letter = "720h"
+removed_chat = "720h"
+
+[runtime]
+memory_limit_mib = 300
