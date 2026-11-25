@@ -540,26 +540,40 @@ func TestWriterCapsDrainBatchAt128(t *testing.T) {
 	assertNoBatchValue(t, rowsAtCommit)
 }
 
+const (
+	commitCrashDirEnv = "YABOT_STORE_TEST_CRASH_DIR"
+	commitCrashExit   = 73
+)
+
 func TestWriterCommitSurvivesCrashBeforeDone(t *testing.T) {
-	const dirEnv = "YABOT_STORE_TEST_CRASH_DIR"
-	const crashExit = 73
-	if dir := os.Getenv(dirEnv); dir != "" {
+	if dir := os.Getenv(commitCrashDirEnv); dir != "" {
 		deps := Deps{
-			Dir:        dir,
-			CacheKiB:   8000,
-			WriteQueue: 16,
-			Metrics:    metrics.NewSet(),
-			Health:     &testHealthRegistry{},
-			Fatal:      func(_ string, err error) { t.Errorf("store faulted: %v", err) },
+			Dir:                dir,
+			CacheKiB:           8000,
+			WriteQueue:         16,
+			CheckpointInterval: 500 * time.Millisecond,
+			Metrics:            metrics.NewSet(),
+			Health:             &testHealthRegistry{},
+			Fatal:              func(_ string, err error) { t.Errorf("store faulted: %v", err) },
 		}
 		s := openBatchTestStore(t, deps)
-		s.hooks = &storeHooks{afterCommit: func() { os.Exit(crashExit) }}
+		s.hooks = &storeHooks{
+			afterCommit:     func() { os.Exit(commitCrashExit) },
+			checkpointTicks: make(chan time.Time),
+		}
 		startBatchTestStore(t, s)
 		results := queueBatchTestOps(t, s, insertBatchItem(42))
 		t.Fatalf("done ran before the simulated crash: %v", nextBatchResult(t, results, 0))
 	}
 
 	deps := newTestDeps(t)
+	crashStoreAfterCommit(t, deps.Dir)
+	s := openTestStore(t, t.Context(), deps)
+	assertBatchIDs(t, s, 42)
+}
+
+func crashStoreAfterCommit(t *testing.T, dir string) {
+	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("find test executable: %v", err)
@@ -567,14 +581,12 @@ func TestWriterCommitSurvivesCrashBeforeDone(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	child := exec.CommandContext(ctx, exe, "-test.run=^TestWriterCommitSurvivesCrashBeforeDone$", "-test.count=1")
-	child.Env = append(child.Environ(), dirEnv+"="+deps.Dir)
+	child.Env = append(child.Environ(), commitCrashDirEnv+"="+dir)
 	output, err := child.CombinedOutput()
 	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != crashExit {
-		t.Fatalf("crash test subprocess = %v, want exit code %d\n%s", err, crashExit, output)
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != commitCrashExit {
+		t.Fatalf("crash test subprocess = %v, want exit code %d\n%s", err, commitCrashExit, output)
 	}
-	s := openTestStore(t, t.Context(), deps)
-	assertBatchIDs(t, s, 42)
 }
 
 func openBatchTestStore(t *testing.T, deps Deps) *Store {

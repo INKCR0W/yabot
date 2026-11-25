@@ -176,6 +176,8 @@ func (s *Store) writeBatch(batch []writeRequest, results []error) error {
 		s.rollbackConnection(ctx, conn)
 		return abortBatch("begin immediate", err)
 	}
+	// A rolled-back batch can leave pages in the WAL, so report activity after the transaction ends.
+	defer s.startedBatches.Add(1)
 	for i, request := range batch {
 		opErr, err := executeOp(tx, request.op)
 		if err != nil {

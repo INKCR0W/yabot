@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/VictoriaMetrics/metrics"
 )
@@ -23,13 +24,14 @@ const (
 )
 
 type Deps struct {
-	Dir        string
-	CacheKiB   int // SQLite stores the negated value as a signed 32-bit integer.
-	Log        *slog.Logger
-	WriteQueue int // Valid range: 1 to 1<<20.
-	Metrics    *metrics.Set
-	Health     HealthRegistry
-	Fatal      func(component string, err error)
+	Dir                string
+	CacheKiB           int // SQLite stores the negated value as a signed 32-bit integer.
+	Log                *slog.Logger
+	WriteQueue         int           // Valid range: 1 to 1<<20.
+	CheckpointInterval time.Duration // Must be positive. The configuration default is 500 ms.
+	Metrics            *metrics.Set
+	Health             HealthRegistry
+	Fatal              func(component string, err error)
 }
 
 type HealthRegistry interface {
@@ -49,18 +51,27 @@ type Store struct {
 	fault      atomic.Pointer[writerFault]
 	hooks      *storeHooks
 
-	mu         sync.Mutex
-	writerDone chan struct{}
-	isStopping bool
-	stopped    chan struct{}
-	stopErr    error
+	checkpointInterval time.Duration
+	checkpointMetrics  checkpointMetrics
+	startedBatches     atomic.Uint64
+
+	mu               sync.Mutex
+	writerDone       chan struct{}
+	checkpointDone   chan struct{}
+	cancelCheckpoint context.CancelFunc
+	isStopping       bool
+	stopped          chan struct{}
+	stopErr          error
 }
 
 type storeHooks struct {
-	beforeCommit    func(*sql.Tx) error
-	afterCommit     func()
-	beforeClosePool func(name string) error
-	afterClosePool  func(name string)
+	beforeCommit        func(*sql.Tx) error
+	afterCommit         func()
+	checkpointTicks     <-chan time.Time
+	beforeCheckpoint    func(context.Context, string) error
+	afterCheckpointTick func(string, checkpointResult, error)
+	beforeClosePool     func(name string) error
+	afterClosePool      func(name string)
 }
 
 func Open(ctx context.Context, deps Deps) (opened *Store, err error) {
@@ -93,11 +104,12 @@ func Open(ctx context.Context, deps Deps) (opened *Store, err error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	s := &Store{
-		lock:    lock,
-		log:     log,
-		fatal:   deps.Fatal,
-		queue:   make(chan writeRequest, deps.WriteQueue),
-		stopped: make(chan struct{}),
+		lock:               lock,
+		log:                log,
+		fatal:              deps.Fatal,
+		queue:              make(chan writeRequest, deps.WriteQueue),
+		checkpointInterval: deps.CheckpointInterval,
+		stopped:            make(chan struct{}),
 	}
 	defer func() {
 		if opened != nil {
@@ -113,24 +125,28 @@ func Open(ctx context.Context, deps Deps) (opened *Store, err error) {
 	}()
 
 	dbPath := filepath.Join(dir, "yabot.db")
-	params := url.Values{"_pragma": {
-		"journal_mode(WAL)",
-		"synchronous(NORMAL)",
-		"busy_timeout(5000)",
-		"foreign_keys(ON)",
-		"wal_autocheckpoint(0)",
-		"journal_size_limit(67108864)",
-		"cache_size(" + strconv.Itoa(-deps.CacheKiB) + ")",
-	}}
+	params := url.Values{
+		"_busy_timeout": {"5000"},
+		"_pragma": {
+			"journal_mode(WAL)",
+			"synchronous(NORMAL)",
+			"foreign_keys(ON)",
+			"wal_autocheckpoint(0)",
+			"journal_size_limit(67108864)",
+			"cache_size(" + strconv.Itoa(-deps.CacheKiB) + ")",
+		},
+	}
 	// The writer creates the database and enables WAL before any read-only connection opens.
 	params.Set("_txlock", "immediate")
 	if s.write, err = openPool(ctx, dbPath, params, 1); err != nil {
 		return nil, fmt.Errorf("open store writer at %q: %w", dbPath, err)
 	}
 	params.Del("_txlock")
+	params.Set("_busy_timeout", "0")
 	if s.checkpoint, err = openPool(ctx, dbPath, params, 1); err != nil {
 		return nil, fmt.Errorf("open store checkpoint connection at %q: %w", dbPath, err)
 	}
+	params.Set("_busy_timeout", "5000")
 	params.Set("mode", "ro")
 	params.Add("_pragma", "query_only(1)")
 	if s.read, err = openPool(ctx, dbPath, params, 2); err != nil {
@@ -140,6 +156,11 @@ func Open(ctx context.Context, deps Deps) (opened *Store, err error) {
 		commitSeconds: deps.Metrics.GetOrCreateHistogram("yabot_store_commit_seconds"),
 		batchSize:     deps.Metrics.GetOrCreateHistogram("yabot_store_batch_size"),
 		batchAborts:   deps.Metrics.GetOrCreateCounter("yabot_store_batch_aborts_total"),
+	}
+	s.checkpointMetrics = checkpointMetrics{
+		walPages:   deps.Metrics.GetOrCreateGauge("yabot_store_wal_pages", nil),
+		walGrowing: deps.Metrics.GetOrCreateGauge("yabot_store_wal_growing", nil),
+		errors:     deps.Metrics.GetOrCreateCounter("yabot_store_checkpoint_errors_total"),
 	}
 	deps.Health.Register(s.Name(), s.checkHealth)
 	return s, nil
@@ -153,6 +174,8 @@ func validateDeps(deps Deps) error {
 		return fmt.Errorf("store cache size must be between 1 and %d KiB: %d", maxCacheKiB, deps.CacheKiB)
 	case deps.WriteQueue <= 0 || deps.WriteQueue > maxWriteQueue:
 		return fmt.Errorf("store write queue capacity must be between 1 and %d: %d", maxWriteQueue, deps.WriteQueue)
+	case deps.CheckpointInterval <= 0:
+		return fmt.Errorf("store checkpoint interval must be positive: %s", deps.CheckpointInterval)
 	case deps.Metrics == nil:
 		return errors.New("store metrics set must not be nil")
 	case isNilHealthRegistry(deps.Health):
@@ -199,7 +222,7 @@ func (s *Store) Read() *sql.DB { return s.read }
 
 func (s *Store) Name() string { return "store" }
 
-// Start leaves the writer available until Stop, including after ctx is canceled.
+// Start runs the writer and checkpointer until Stop, independently of the startup context.
 func (s *Store) Start(context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -209,13 +232,17 @@ func (s *Store) Start(context.Context) error {
 	if s.writerDone != nil {
 		return errors.New("store has already started")
 	}
+	checkpointCtx, cancelCheckpoint := context.WithCancel(context.Background())
+	s.cancelCheckpoint = cancelCheckpoint
 	s.writerDone = make(chan struct{})
+	s.checkpointDone = make(chan struct{})
 	go s.runWriter()
+	go s.runCheckpoints(checkpointCtx)
 	return nil
 }
 
-// Stop drains accepted writes before closing the pools and releasing the directory lock.
-// If ctx ends first, draining and cleanup continue in the background.
+// Stop drains accepted writes, stops the checkpointer, closes the pools and releases the directory lock in that order.
+// If ctx ends first, cleanup continues in the background.
 func (s *Store) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if !s.isStopping {
@@ -241,6 +268,8 @@ func (s *Store) Stop(ctx context.Context) error {
 func (s *Store) finishStop(writerDone <-chan struct{}) {
 	if writerDone != nil {
 		<-writerDone
+		s.cancelCheckpoint()
+		<-s.checkpointDone
 	}
 	s.stopErr = s.close()
 	close(s.stopped)

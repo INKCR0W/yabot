@@ -35,14 +35,15 @@ func TestOpenConnectionPragmas(t *testing.T) {
 		}
 	}
 	connections := []struct {
-		name      string
-		conn      *sql.Conn
-		queryOnly string
+		name        string
+		conn        *sql.Conn
+		queryOnly   string
+		busyTimeout string
 	}{
-		{"writer", takeTestConn(t, s.write), "0"},
-		{"reader 1", takeTestConn(t, s.Read()), "1"},
-		{"reader 2", takeTestConn(t, s.Read()), "1"},
-		{"checkpoint", takeTestConn(t, s.checkpoint), "0"},
+		{"writer", takeTestConn(t, s.write), "0", "5000"},
+		{"reader 1", takeTestConn(t, s.Read()), "1", "5000"},
+		{"reader 2", takeTestConn(t, s.Read()), "1", "5000"},
+		{"checkpoint", takeTestConn(t, s.checkpoint), "0", "0"},
 	}
 	for _, connection := range connections {
 		t.Run(connection.name, func(t *testing.T) {
@@ -52,7 +53,7 @@ func TestOpenConnectionPragmas(t *testing.T) {
 			}{
 				{"journal_mode", "wal"},
 				{"synchronous", "1"},
-				{"busy_timeout", "5000"},
+				{"busy_timeout", connection.busyTimeout},
 				{"foreign_keys", "1"},
 				{"wal_autocheckpoint", "0"},
 				{"journal_size_limit", "67108864"},
@@ -125,9 +126,6 @@ func TestWriterBeginsImmediateTransaction(t *testing.T) {
 	}()
 
 	conn := takeTestConn(t, s.checkpoint)
-	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout=0"); err != nil {
-		t.Fatalf("disable checkpoint connection busy timeout: %v", err)
-	}
 	_, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE")
 	if err == nil {
 		if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
@@ -238,6 +236,8 @@ func TestOpenValidatesDeps(t *testing.T) {
 		{"zero queue", func(deps *Deps) { deps.WriteQueue = 0 }, "queue capacity"},
 		{"negative queue", func(deps *Deps) { deps.WriteQueue = -1 }, "queue capacity"},
 		{"queue exceeds limit", func(deps *Deps) { deps.WriteQueue = 1<<20 + 1 }, "queue capacity"},
+		{"zero checkpoint interval", func(deps *Deps) { deps.CheckpointInterval = 0 }, "checkpoint interval"},
+		{"negative checkpoint interval", func(deps *Deps) { deps.CheckpointInterval = -time.Millisecond }, "checkpoint interval"},
 		{"nil metrics", func(deps *Deps) { deps.Metrics = nil }, "metrics set"},
 		{"nil health", func(deps *Deps) { deps.Health = nil }, "health registry"},
 		{"typed nil health", func(deps *Deps) { deps.Health = (*testHealthRegistry)(nil) }, "health registry"},
@@ -340,11 +340,12 @@ func (h *testHealthRegistry) Register(name string, check func() error) {
 func newTestDeps(t *testing.T) Deps {
 	t.Helper()
 	return Deps{
-		Dir:        testDir(t),
-		CacheKiB:   8000,
-		WriteQueue: 4096,
-		Metrics:    metrics.NewSet(),
-		Health:     &testHealthRegistry{},
+		Dir:                testDir(t),
+		CacheKiB:           8000,
+		WriteQueue:         4096,
+		CheckpointInterval: 500 * time.Millisecond,
+		Metrics:            metrics.NewSet(),
+		Health:             &testHealthRegistry{},
 		Fatal: func(name string, err error) {
 			t.Errorf("unexpected fatal error from %s: %v", name, err)
 		},

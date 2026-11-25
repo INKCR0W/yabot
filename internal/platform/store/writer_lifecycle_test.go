@@ -384,6 +384,101 @@ func TestStopRetainsLockAndSharesCloseResult(t *testing.T) {
 	}
 }
 
+func TestStopWaitsForActiveCheckpointBeforeClosingPools(t *testing.T) {
+	deps := newTestDeps(t)
+	s := openBatchTestStore(t, deps)
+	ticks := make(chan time.Time, 1)
+	checkpointStarted := make(chan context.Context, 1)
+	checkpointFinishing := newBatchTestGate(t)
+	releaseOnFailure := make(chan struct{})
+	t.Cleanup(func() { close(releaseOnFailure) })
+
+	var poolsClosed int
+	assertBackgroundStopped := func(name string) {
+		t.Helper()
+		select {
+		case <-s.writerDone:
+		default:
+			t.Errorf("pool %q closed before writer exited", name)
+		}
+		select {
+		case <-s.checkpointDone:
+		default:
+			t.Errorf("pool %q closed before checkpointer exited", name)
+		}
+	}
+	s.hooks = &storeHooks{
+		checkpointTicks: ticks,
+		beforeCheckpoint: func(ctx context.Context, _ string) error {
+			checkpointStarted <- ctx
+			select {
+			case <-ctx.Done():
+				select {
+				case <-s.writerDone:
+				default:
+					t.Error("checkpoint canceled before writer exited")
+				}
+				return nil
+			case <-releaseOnFailure:
+				return ctx.Err()
+			}
+		},
+		afterCheckpointTick: func(_ string, _ checkpointResult, err error) {
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("checkpoint at Stop = %v, want context.Canceled", err)
+			}
+			checkpointFinishing.block()
+		},
+		beforeClosePool: func(name string) error {
+			assertBackgroundStopped(name)
+			return nil
+		},
+		afterClosePool: func(name string) {
+			assertBackgroundStopped(name)
+			poolsClosed++
+		},
+	}
+	startBatchTestStore(t, s)
+	if err := s.WriteWait(t.Context(), insertBatchItem(1)); err != nil {
+		t.Fatalf("commit before checkpoint: %v", err)
+	}
+	ticks <- time.Now()
+	checkpointCtx := awaitLifecycleResult(t, checkpointStarted)
+	releaseWriter, writerResult := holdLifecycleWrite(t, s, insertBatchItem(2))
+
+	expired, cancelExpired := context.WithDeadline(t.Context(), time.Time{})
+	defer cancelExpired()
+	if err := s.Stop(expired); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop during writer drain = %v, want context.DeadlineExceeded", err)
+	}
+	if err := checkpointCtx.Err(); err != nil {
+		t.Errorf("checkpoint context during writer drain = %v", err)
+	}
+	releaseWriter()
+	if err := awaitLifecycleResult(t, writerResult); err != nil {
+		t.Fatalf("drain accepted write: %v", err)
+	}
+	awaitLifecycleResult(t, checkpointFinishing.entered)
+
+	ctx, cancel := context.WithTimeout(t.Context(), lifecycleWait)
+	defer cancel()
+	for _, pool := range []*sql.DB{s.Read(), s.checkpoint, s.write} {
+		var value int
+		if err := pool.QueryRowContext(ctx, "SELECT 1").Scan(&value); err != nil {
+			t.Fatalf("query pool while checkpoint is still exiting: %v", err)
+		}
+	}
+	checkpointFinishing.release()
+	if err := s.Stop(ctx); err != nil {
+		t.Fatalf("wait for Stop: %v", err)
+	}
+	if poolsClosed != 3 {
+		t.Errorf("closed %d pools, want 3", poolsClosed)
+	}
+	assertBatchMetric(t, deps.Metrics, "yabot_store_checkpoint_errors_total", 0)
+	assertBatchIDs(t, reopenLifecycleStore(t, deps), 1, 2)
+}
+
 func TestWriteWaitResults(t *testing.T) {
 	writeErr := errors.New("business rule rejected write")
 	for _, test := range []struct {
