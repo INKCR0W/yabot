@@ -26,6 +26,39 @@ type backupFiles struct {
 // BackupDir returns the absolute path to the store's default backup directory.
 func (s *Store) BackupDir() string { return s.backupDir }
 
+// LatestBackup returns the UTC timestamp in the newest published daily snapshot's filename.
+// A missing directory or a directory without daily snapshots yields false and a nil error.
+func LatestBackup(dir string) (time.Time, bool, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		// On Windows, ReadDir can report ErrNotExist for an existing file.
+		info, statErr := os.Stat(dir)
+		if errors.Is(statErr, os.ErrNotExist) {
+			return time.Time{}, false, nil
+		}
+		if statErr != nil {
+			return time.Time{}, false, fmt.Errorf("check store backup directory: %w", statErr)
+		}
+		if !info.IsDir() {
+			return time.Time{}, false, fmt.Errorf("store backup path %q is not a directory", dir)
+		}
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("list store backups: %w", err)
+	}
+	// ReadDir sorts daily filenames in timestamp order.
+	for _, entry := range slices.Backward(entries) {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		stamp, target, ok := parseBackupName(entry.Name())
+		if ok && target == "" {
+			return stamp, true, nil
+		}
+	}
+	return time.Time{}, false, nil
+}
+
 // Backup retains the new daily snapshot and up to keep-1 of the newest daily snapshots.
 // The parent of dir must exist, keep must be positive, and calls on the same store are serialized.
 // A snapshot can contain an unfinished upgrade marker. Schedule daily backups after migration succeeds.
@@ -233,7 +266,7 @@ func prepareBackup(dir string, preMigration bool) (backupFiles, error) {
 		if !isTemp {
 			name, isTemp = strings.CutSuffix(name, ".tmp")
 		}
-		target, ok := parseBackupName(name)
+		_, target, ok := parseBackupName(name)
 		if !ok {
 			continue
 		}
@@ -248,10 +281,10 @@ func prepareBackup(dir string, preMigration bool) (backupFiles, error) {
 	return files, errors.Join(errs...)
 }
 
-func parseBackupName(name string) (target string, ok bool) {
+func parseBackupName(name string) (stamp time.Time, target string, ok bool) {
 	base, ok := strings.CutSuffix(name, ".db")
 	if !ok {
-		return "", false
+		return time.Time{}, "", false
 	}
 	var timestamp string
 	if suffix, isPreMigration := strings.CutPrefix(base, preMigrationPrefix); isPreMigration {
@@ -260,16 +293,16 @@ func parseBackupName(name string) (target string, ok bool) {
 			strings.IndexFunc(target, func(r rune) bool {
 				return !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f')
 			}) >= 0 {
-			return "", false
+			return time.Time{}, "", false
 		}
 	} else {
 		timestamp, ok = strings.CutPrefix(base, dailyBackupPrefix)
 		if !ok {
-			return "", false
+			return time.Time{}, "", false
 		}
 	}
 	stamp, err := time.Parse(backupStampLayout, timestamp)
-	return target, err == nil && stamp.Format(backupStampLayout) == timestamp
+	return stamp, target, err == nil && stamp.Format(backupStampLayout) == timestamp
 }
 
 func (files backupFiles) prune(dir, retainedName string, keep int) (int, error) {

@@ -21,6 +21,69 @@ import (
 
 const backupTestName = "yabot-20261125T153000.123Z.db"
 
+func TestLatestBackup(t *testing.T) {
+	stamp := time.Date(2026, time.November, 25, 15, 30, 0, 123_000_000, time.UTC)
+	for _, tc := range []struct {
+		name    string
+		setup   func(t *testing.T, dir string)
+		want    time.Time
+		wantErr bool
+	}{
+		{name: "missing directory"},
+		{name: "empty directory", setup: func(t *testing.T, dir string) {
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "regular file", wantErr: true, setup: func(t *testing.T, dir string) {
+			if err := os.WriteFile(dir, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "mixed files", want: stamp, setup: func(t *testing.T, dir string) {
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			const older = "yabot-20261125T153000.122Z.db"
+			for _, name := range []string{
+				older,
+				backupTestName,
+				"yabot-premigrate-20261126T153000.123Z-0123456789ab.db",
+				"yabot-20261126T153000.123Z.db.tmp",
+				"yabot-20261126T153000.123Z.db.tmp-journal",
+				"yabot-20261126T153000.1234Z.db",
+				"yabot-20261131T153000.123Z.db",
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Mkdir(filepath.Join(dir, "yabot-20261127T153000.123Z.db"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			newerMtime := stamp.Add(time.Hour)
+			if err := os.Chtimes(filepath.Join(dir, older), newerMtime, newerMtime); err != nil {
+				t.Fatal(err)
+			}
+			olderMtime := stamp.Add(-time.Hour)
+			if err := os.Chtimes(filepath.Join(dir, backupTestName), olderMtime, olderMtime); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(testDir(t), "backup")
+			if tc.setup != nil {
+				tc.setup(t, dir)
+			}
+			got, ok, err := LatestBackup(dir)
+			if wantOK := !tc.want.IsZero(); (err != nil) != tc.wantErr || ok != wantOK || got != tc.want {
+				t.Errorf("LatestBackup = (%v, %t, %v), want time %v, found %t, error present %t", got, ok, err, tc.want, wantOK, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestBackupSnapshot(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.Now = backupTestTime
