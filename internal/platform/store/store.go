@@ -5,20 +5,35 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
-	_ "modernc.org/sqlite"
+	"github.com/VictoriaMetrics/metrics"
 )
 
-const maxCacheKiB int64 = 1 << 31
+const (
+	maxCacheKiB   int64 = 1 << 31
+	maxWriteQueue       = 1 << 20
+)
 
 type Deps struct {
-	Dir      string
-	CacheKiB int // SQLite stores the negated value as a signed 32-bit integer.
+	Dir        string
+	CacheKiB   int // SQLite stores the negated value as a signed 32-bit integer.
+	Log        *slog.Logger
+	WriteQueue int // Valid range: 1 to 1<<20.
+	Metrics    *metrics.Set
+	Health     HealthRegistry
+	Fatal      func(component string, err error)
+}
+
+type HealthRegistry interface {
+	Register(name string, check func() error)
 }
 
 // Store owns the database pools and data directory lock. It must be opened with Open and must not be copied.
@@ -27,16 +42,30 @@ type Store struct {
 	read       *sql.DB
 	checkpoint *sql.DB
 	lock       *os.File
-	stopOnce   sync.Once
+	log        *slog.Logger
+	fatal      func(string, error)
+	metrics    writerMetrics
+	queue      chan writeRequest
+	fault      atomic.Pointer[writerFault]
+	hooks      *storeHooks
+
+	mu         sync.Mutex
+	writerDone chan struct{}
+	isStopping bool
+	stopped    chan struct{}
 	stopErr    error
 }
 
-func Open(ctx context.Context, deps Deps) (_ *Store, err error) {
-	if deps.Dir == "" {
-		return nil, errors.New("store data directory must not be empty")
-	}
-	if deps.CacheKiB <= 0 || int64(deps.CacheKiB) > maxCacheKiB {
-		return nil, fmt.Errorf("store cache size must be between 1 and %d KiB: %d", maxCacheKiB, deps.CacheKiB)
+type storeHooks struct {
+	beforeCommit    func(*sql.Tx) error
+	afterCommit     func()
+	beforeClosePool func(name string) error
+	afterClosePool  func(name string)
+}
+
+func Open(ctx context.Context, deps Deps) (opened *Store, err error) {
+	if err := validateDeps(deps); err != nil {
+		return nil, err
 	}
 	dir, err := filepath.Abs(deps.Dir)
 	if err != nil {
@@ -59,10 +88,27 @@ func Open(ctx context.Context, deps Deps) (_ *Store, err error) {
 		return nil, errors.Join(err, closeLockFile(lock))
 	}
 
-	s := &Store{lock: lock}
+	log := deps.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	s := &Store{
+		lock:    lock,
+		log:     log,
+		fatal:   deps.Fatal,
+		queue:   make(chan writeRequest, deps.WriteQueue),
+		stopped: make(chan struct{}),
+	}
 	defer func() {
-		if err != nil {
-			err = errors.Join(err, s.close())
+		if opened != nil {
+			return
+		}
+		if closeErr := s.close(); closeErr != nil {
+			if err == nil {
+				log.Error("store cleanup failed during open", "error", closeErr)
+			} else {
+				err = errors.Join(err, closeErr)
+			}
 		}
 	}()
 
@@ -90,7 +136,44 @@ func Open(ctx context.Context, deps Deps) (_ *Store, err error) {
 	if s.read, err = openPool(ctx, dbPath, params, 2); err != nil {
 		return nil, fmt.Errorf("open store reader at %q: %w", dbPath, err)
 	}
+	s.metrics = writerMetrics{
+		commitSeconds: deps.Metrics.GetOrCreateHistogram("yabot_store_commit_seconds"),
+		batchSize:     deps.Metrics.GetOrCreateHistogram("yabot_store_batch_size"),
+		batchAborts:   deps.Metrics.GetOrCreateCounter("yabot_store_batch_aborts_total"),
+	}
+	deps.Health.Register(s.Name(), s.checkHealth)
 	return s, nil
+}
+
+func validateDeps(deps Deps) error {
+	switch {
+	case deps.Dir == "":
+		return errors.New("store data directory must not be empty")
+	case deps.CacheKiB <= 0 || int64(deps.CacheKiB) > maxCacheKiB:
+		return fmt.Errorf("store cache size must be between 1 and %d KiB: %d", maxCacheKiB, deps.CacheKiB)
+	case deps.WriteQueue <= 0 || deps.WriteQueue > maxWriteQueue:
+		return fmt.Errorf("store write queue capacity must be between 1 and %d: %d", maxWriteQueue, deps.WriteQueue)
+	case deps.Metrics == nil:
+		return errors.New("store metrics set must not be nil")
+	case isNilHealthRegistry(deps.Health):
+		return errors.New("store health registry must not be nil")
+	case deps.Fatal == nil:
+		return errors.New("store fatal callback must not be nil")
+	default:
+		return nil
+	}
+}
+
+func isNilHealthRegistry(registry HealthRegistry) bool {
+	value := reflect.ValueOf(registry)
+	switch value.Kind() {
+	case reflect.Invalid:
+		return true
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func openPool(ctx context.Context, path string, params url.Values, limit int) (*sql.DB, error) {
@@ -116,12 +199,58 @@ func (s *Store) Read() *sql.DB { return s.read }
 
 func (s *Store) Name() string { return "store" }
 
-func (s *Store) Start(context.Context) error { return nil }
+// Start leaves the writer available until Stop, including after ctx is canceled.
+func (s *Store) Start(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.isStopping {
+		return ErrClosed
+	}
+	if s.writerDone != nil {
+		return errors.New("store has already started")
+	}
+	s.writerDone = make(chan struct{})
+	go s.runWriter()
+	return nil
+}
 
-// Stop closes the pools and releases the data directory lock. Concurrent calls return the same result.
-func (s *Store) Stop(context.Context) error {
-	s.stopOnce.Do(func() { s.stopErr = s.close() })
-	return s.stopErr
+// Stop drains accepted writes before closing the pools and releasing the directory lock.
+// If ctx ends first, draining and cleanup continue in the background.
+func (s *Store) Stop(ctx context.Context) error {
+	s.mu.Lock()
+	if !s.isStopping {
+		s.isStopping = true
+		close(s.queue)
+		go s.finishStop(s.writerDone)
+	}
+	s.mu.Unlock()
+
+	select {
+	case <-s.stopped:
+		return s.stopErr
+	case <-ctx.Done():
+		select {
+		case <-s.stopped:
+			return s.stopErr
+		default:
+			return fmt.Errorf("stop store: %w", ctx.Err())
+		}
+	}
+}
+
+func (s *Store) finishStop(writerDone <-chan struct{}) {
+	if writerDone != nil {
+		<-writerDone
+	}
+	s.stopErr = s.close()
+	close(s.stopped)
+}
+
+func (s *Store) checkHealth() error {
+	if fault := s.fault.Load(); fault != nil {
+		return fault
+	}
+	return nil
 }
 
 func (s *Store) close() error {
@@ -137,8 +266,16 @@ func (s *Store) close() error {
 		if pool.db == nil {
 			continue
 		}
+		if s.hooks != nil && s.hooks.beforeClosePool != nil {
+			if err := s.hooks.beforeClosePool(pool.name); err != nil {
+				errs = append(errs, fmt.Errorf("close store %s: %w", pool.name, err))
+			}
+		}
 		if err := pool.db.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close store %s: %w", pool.name, err))
+		}
+		if s.hooks != nil && s.hooks.afterClosePool != nil {
+			s.hooks.afterClosePool(pool.name)
 		}
 	}
 	if err := unlockFile(s.lock); err != nil {
