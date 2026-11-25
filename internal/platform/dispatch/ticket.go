@@ -24,6 +24,7 @@ func (sh *Shard) Admit() (Ticket, bool) {
 }
 
 // Complete may run on any goroutine. It panics on a zero ticket or a nil callback.
+// Wrap fn with SettleOnPanic when it settles a critical ack.
 func (t Ticket) Complete(fn func(ctx context.Context, sh *Shard)) {
 	if fn == nil {
 		panic("dispatch: ticket completion callback must not be nil")

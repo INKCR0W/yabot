@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/maphash"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -128,7 +129,7 @@ func New(deps Deps) (*Dispatcher, error) {
 }
 
 func (d *Dispatcher) bindMetrics(set *metrics.Set) {
-	d.panics = set.GetOrCreateCounter(`yabot_dispatch_panics_total{route="none"}`)
+	d.panics = set.GetOrCreateCounter(panicsMetric + `{route="none"}`)
 	d.lateComplete = set.GetOrCreateCounter(`yabot_dispatch_ticket_late_total{op="complete"}`)
 	d.lateCancel = set.GetOrCreateCounter(`yabot_dispatch_ticket_late_total{op="cancel"}`)
 	d.lateDone = set.GetOrCreateCounter("yabot_dispatch_run_on_all_done_late_total")
@@ -142,6 +143,35 @@ func (d *Dispatcher) bindMetrics(set *metrics.Set) {
 			return float64(sh.inUse.Load())
 		})
 	}
+}
+
+const panicsMetric = "yabot_dispatch_panics_total"
+
+func routeMetricLabel(route string) string {
+	label := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(route)
+	return `{route="` + label + `"}`
+}
+
+func (d *Dispatcher) panicCounter(route string) *metrics.Counter {
+	if route == "" {
+		return d.panics
+	}
+	if d.deps.Metrics == nil {
+		return nil
+	}
+	return d.deps.Metrics.GetOrCreateCounter(panicsMetric + routeMetricLabel(route))
+}
+
+func (d *Dispatcher) countPanic(route string) {
+	if counter := d.panicCounter(route); counter != nil {
+		counter.Inc()
+	}
+}
+
+func (d *Dispatcher) reportRoutingPanic(route string, updateID int64, err *PanicError) {
+	d.countPanic(route)
+	d.deps.Log.Error("dispatch update routing panicked", "route", route, "update_id", updateID,
+		"panic", err.Value, "stack", string(err.Stack), "error", err)
 }
 
 func (d *Dispatcher) Name() string { return "dispatch" }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -172,27 +171,27 @@ func (sh *Shard) execute(ctx context.Context, item work) {
 }
 
 type PanicError struct {
+	// Shard is -1 for routing callbacks executed before work reaches a shard.
 	Shard int
 	Value any
 	Stack []byte
 }
 
+const ingressPanicShard = -1
+
 func (e *PanicError) Error() string {
+	if e.Shard == ingressPanicShard {
+		return fmt.Sprintf("dispatch: update routing panicked: %v", e.Value)
+	}
 	return fmt.Sprintf("dispatch: shard %d task panicked: %v", e.Shard, e.Value)
 }
 
 func (sh *Shard) reportPanic(ctx context.Context, item work, err *PanicError) {
 	d := sh.dispatcher
+	d.countPanic(item.route)
 	route := item.route
-	counter := d.panics
 	if route == "" {
 		route = "none"
-	} else if d.deps.Metrics != nil {
-		label := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(route)
-		counter = d.deps.Metrics.GetOrCreateCounter(`yabot_dispatch_panics_total{route="` + label + `"}`)
-	}
-	if counter != nil {
-		counter.Inc()
 	}
 	d.deps.Log.ErrorContext(ctx, "dispatch task panicked", "shard", sh.index, "key", item.key, "route", route,
 		"panic", err.Value, "stack", string(err.Stack), "error", err)
