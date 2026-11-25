@@ -261,18 +261,17 @@ func (e *validationErrors) validateWorkerQuota(c SenderConfig) {
 	decisionFits := c.Reserved.Decision <= c.Workers
 	e.require(c.Reserved.Deadline <= 0 || deadlineFits, "sender.reserved.deadline", "must be <= sender.workers")
 	e.require(c.Reserved.Decision <= 0 || decisionFits, "sender.reserved.decision", "must be <= sender.workers")
-	capLimit := c.Workers
+	capLimit := 0
 	capLimitMessage := "must be <= sender.workers"
-	if c.Workers > 0 && deadlineFits && decisionFits {
-		// Minimum valid reservations bound the shared pool, and subtraction avoids overflow.
-		remaining := c.Workers - max(c.Reserved.Deadline, 1)
+	if c.Workers > 0 {
+		// Clamp the first subtraction so the shared pool calculation cannot overflow.
+		remaining := max(0, c.Workers-max(c.Reserved.Deadline, 1))
 		decision := max(c.Reserved.Decision, 1)
-		if decision > remaining {
+		if deadlineFits && decisionFits && decision > remaining {
 			e.add("sender.reserved", "deadline + decision must be <= sender.workers")
-		} else {
-			capLimit = remaining - decision
-			capLimitMessage = "must be <= the number of shared workers"
 		}
+		capLimit = max(0, remaining-decision)
+		capLimitMessage = "must be <= the number of shared workers"
 	}
 	e.require(c.Cap.Interactive <= 0 || c.Cap.Interactive <= capLimit, "sender.cap.interactive", capLimitMessage)
 	e.require(c.Cap.Background <= 0 || c.Cap.Background <= capLimit, "sender.cap.background", capLimitMessage)

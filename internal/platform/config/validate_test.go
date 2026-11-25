@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -448,46 +449,85 @@ func TestValidateReportsIndependentConflicts(t *testing.T) {
 	}{
 		{"blacklist reports each non-positive user ID", func(c *Config) {
 			c.Guard.Blacklist = []int64{123, 0, -456}
-		}, []string{"guard.blacklist[1]: ", "guard.blacklist[2]: "}},
+		}, []string{"guard.blacklist[1]: must be a positive user ID", "guard.blacklist[2]: must be a positive user ID"}},
+		{"negative guard durations report positivity and cross-checks", func(c *Config) {
+			c.Guard.RecentClosedTTL = -Duration(time.Second)
+			c.Retention.GuardHistory = -Duration(2 * time.Second)
+		}, []string{
+			"guard.recent_closed_ttl: must be > 0",
+			"guard.recent_closed_ttl: must be > guard.backlog_cutoff",
+			"retention.guard_history: must be > 0",
+			"retention.guard_history: must be >= guard.recent_closed_ttl",
+		}},
+		{"combined reservations and caps exceed available workers", func(c *Config) {
+			c.Sender.Workers = 12
+			c.Sender.Reserved.Deadline = 9
+			c.Sender.Reserved.Decision = 4
+			c.Sender.Cap.Interactive = 12
+		}, []string{
+			"sender.reserved: deadline + decision must be <= sender.workers",
+			"sender.cap.interactive: must be <= the number of shared workers",
+			"sender.cap.background: must be <= the number of shared workers",
+		}},
 		{"oversized deadline and nonpositive decision", func(c *Config) {
 			c.Sender.Workers = 16
-			c.Sender.Reserved.Deadline = 17
+			c.Sender.Reserved.Deadline = math.MaxInt
 			c.Sender.Reserved.Decision = 0
-		}, []string{"sender.reserved.deadline: must be <= sender.workers", "sender.reserved.decision: must be > 0"}},
+		}, []string{
+			"sender.reserved.deadline: must be <= sender.workers",
+			"sender.reserved.decision: must be > 0",
+			"sender.cap.interactive: must be <= the number of shared workers",
+		}},
 		{"nonpositive deadline and oversized decision", func(c *Config) {
 			c.Sender.Reserved.Deadline = math.MinInt
 			c.Sender.Reserved.Decision = math.MaxInt
-			c.Sender.Cap.Background = 17
-		}, []string{"sender.reserved.deadline: must be > 0", "sender.reserved.decision: must be <= sender.workers", "sender.cap.background: must be <= sender.workers"}},
+		}, []string{
+			"sender.reserved.deadline: must be > 0",
+			"sender.reserved.decision: must be <= sender.workers",
+			"sender.cap.background: must be <= the number of shared workers",
+		}},
+		{"both reservations exceed a small pool without overflow", func(c *Config) {
+			c.Sender.Reserved.Deadline = math.MaxInt
+			c.Sender.Reserved.Decision = math.MaxInt
+		}, []string{
+			"sender.reserved.deadline: must be <= sender.workers",
+			"sender.reserved.decision: must be <= sender.workers",
+			"sender.cap.interactive: must be <= the number of shared workers",
+			"sender.cap.background: must be <= the number of shared workers",
+		}},
 		{"nonpositive decision cannot leave enough room for interactive cap", func(c *Config) {
 			c.Sender.Reserved.Deadline = 12
 			c.Sender.Reserved.Decision = 0
 		}, []string{"sender.reserved.decision: must be > 0", "sender.cap.interactive: must be <= the number of shared workers"}},
 		{"nonpositive workers also fail throughput and quota checks", func(c *Config) {
 			c.Sender.Workers = 0
-		}, []string{"sender.workers: must be > 0", "sender.workers: must be >= sender.global_rps", "sender.reserved.deadline: must be <= sender.workers"}},
+		}, []string{"sender.workers: must be > 0", "sender.workers: must be >= sender.global_rps × 0.3 × 1.5", "sender.reserved.deadline: must be <= sender.workers"}},
 		{"invalid shard count and insufficient queue even with one shard", func(c *Config) {
 			c.Dispatch.Shards = 0
 			c.Store.WriteQueue = 1023
-		}, []string{"dispatch.shards: must be > 0", "store.write_queue: must be >= dispatch.shards"}},
+		}, []string{"dispatch.shards: must be > 0", "store.write_queue: must be >= dispatch.shards × dispatch.tickets_per_shard"}},
 		{"nonpositive queue cannot fit tickets", func(c *Config) {
 			c.Store.WriteQueue = 0
-		}, []string{"store.write_queue: must be > 0", "store.write_queue: must be >= dispatch.shards"}},
+		}, []string{"store.write_queue: must be > 0", "store.write_queue: must be >= dispatch.shards × dispatch.tickets_per_shard"}},
 		{"invalid public origin and mismatched hostname", func(c *Config) {
 			c.HTTP.PublicBaseURL = "http://other.example.com/miniapp"
-		}, []string{"http.public_base_url: must be an HTTPS origin", "turnstile.hostname: must match the hostname in http.public_base_url"}},
+		}, []string{"http.public_base_url: must be an HTTPS origin with an optional trailing slash", "turnstile.hostname: must match the hostname in http.public_base_url"}},
 		{"forbidden listen spelling and duplicate socket", func(c *Config) {
 			c.Admin.Listen = "[127.0.0.1]:08080"
-		}, []string{"admin.listen: host must be the IPv4 literal 127.0.0.1", "admin.listen: must not use the same address and port as http.listen"}},
+		}, []string{"admin.listen: host must be the IPv4 literal 127.0.0.1 for the local listener", "admin.listen: must not use the same address and port as http.listen"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := validConfigForValidation()
 			tc.change(&c)
-			err := requireValidation(t, c, tc.want[0])
-			for _, want := range tc.want[1:] {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("Validate returned %v, want an error containing %q", err, want)
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("Validate succeeded, want errors %q", tc.want)
+			}
+			messages := strings.Split(err.Error(), "\n")
+			for _, want := range tc.want {
+				if !slices.Contains(messages, want) {
+					t.Errorf("Validate returned %v, missing error %q", err, want)
 				}
 			}
 		})
