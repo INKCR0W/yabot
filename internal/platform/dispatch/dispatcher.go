@@ -35,6 +35,8 @@ type Deps struct {
 	Metrics                        *metrics.Set
 	// NewTicker is called once per shard, concurrently, with the interval after defaults are applied.
 	NewTicker func(shard int, interval time.Duration) (ticks <-chan time.Time, stop func())
+	// Now supplies replay deadlines and must be safe for concurrent calls. It defaults to time.Now.
+	Now func() time.Time
 }
 
 type dispatcherState uint8
@@ -69,10 +71,11 @@ type Dispatcher struct {
 	stopped     chan struct{}
 	stopErr     error
 
-	panics       *metrics.Counter
-	lateComplete *metrics.Counter
-	lateCancel   *metrics.Counter
-	lateDone     *metrics.Counter
+	panics          *metrics.Counter
+	lateComplete    *metrics.Counter
+	lateCancel      *metrics.Counter
+	lateDone        *metrics.Counter
+	mailboxOverflow *metrics.Counter
 }
 
 // New defaults Tick to 200 ms and uses a discard logger when Log is nil.
@@ -101,6 +104,9 @@ func New(deps Deps) (*Dispatcher, error) {
 			return ticker.C, ticker.Stop
 		}
 	}
+	if deps.Now == nil {
+		deps.Now = time.Now
+	}
 
 	d := &Dispatcher{
 		deps:        deps,
@@ -126,6 +132,7 @@ func (d *Dispatcher) bindMetrics(set *metrics.Set) {
 	d.lateComplete = set.GetOrCreateCounter(`yabot_dispatch_ticket_late_total{op="complete"}`)
 	d.lateCancel = set.GetOrCreateCounter(`yabot_dispatch_ticket_late_total{op="cancel"}`)
 	d.lateDone = set.GetOrCreateCounter("yabot_dispatch_run_on_all_done_late_total")
+	d.mailboxOverflow = set.GetOrCreateCounter("yabot_dispatch_mailbox_overflow_total")
 	for i, sh := range d.shards {
 		label := fmt.Sprintf(`{shard="%d"}`, i)
 		set.GetOrCreateGauge("yabot_dispatch_inbox_depth"+label, func() float64 {
@@ -247,8 +254,11 @@ func (d *Dispatcher) Submit(k Key, t Task) error {
 }
 
 func (d *Dispatcher) submit(k Key, route string, t Task, onPanic func(error)) error {
-	index := maphash.Comparable(d.seed, k) % uint64(len(d.shards))
-	return d.enqueue(d.shards[index], work{key: k, route: route, task: t, onPanic: onPanic})
+	return d.enqueue(d.shards[d.shardIndex(k)], work{key: k, route: route, task: t, onPanic: onPanic})
+}
+
+func (d *Dispatcher) shardIndex(k Key) int {
+	return int(maphash.Comparable(d.seed, k) % uint64(len(d.shards)))
 }
 
 func (d *Dispatcher) enqueue(sh *Shard, item work) error {

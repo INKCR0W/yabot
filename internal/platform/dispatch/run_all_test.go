@@ -218,8 +218,12 @@ func TestRunOnAllPanic(t *testing.T) {
 					}
 					panic("async task panicked")
 				})
-				if err == nil || !strings.Contains(err.Error(), "async task panicked") {
-					t.Fatalf("RunOnAll = %v, want the panic error", err)
+				var panicErr *dispatch.PanicError
+				if !errors.As(err, &panicErr) || panicErr == nil {
+					t.Fatalf("RunOnAll = %v (%T), want *dispatch.PanicError", err, err)
+				}
+				if panicErr.Value != "async task panicked" || !strings.Contains(err.Error(), "async task panicked") || len(panicErr.Stack) == 0 {
+					t.Errorf("RunOnAll = %v, value = %v, stack size = %d", err, panicErr.Value, len(panicErr.Stack))
 				}
 			})
 		})

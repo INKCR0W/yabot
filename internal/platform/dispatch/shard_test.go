@@ -2,6 +2,8 @@ package dispatch
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"runtime"
 	"slices"
@@ -54,10 +56,9 @@ func TestShardDrainsReadyBeforeNextInboxTask(t *testing.T) {
 		release := holdShardForTicketTest(t, d)
 		events := make(chan string, 3)
 		submitTicketTestTask(t, d, func(_ context.Context, sh *Shard) {
-			sh.ready = append(sh.ready,
-				work{task: func(context.Context, *Shard) { events <- "ready 1" }},
-				work{task: func(context.Context, *Shard) { events <- "ready 2" }},
-			)
+			for _, event := range []string{"ready 1", "ready 2"} {
+				sh.DeferInternal(Key{}, mailboxLifecycleItem(t, func(context.Context, *Shard) { events <- event }))
+			}
 		})
 		submitTicketTestTask(t, d, func(context.Context, *Shard) { events <- "inbox" })
 		release()
@@ -198,6 +199,8 @@ func TestOnTickWithDefaultTicker(t *testing.T) {
 func TestCompletionAndTickRecoverFromPanics(t *testing.T) {
 	deps := testDeps()
 	deps.Metrics = metrics.NewSet()
+	panicLog := &workPanicLog{Handler: slog.DiscardHandler}
+	deps.Log = slog.New(panicLog)
 	ticks := make(chan time.Time, 1)
 	deps.NewTicker = func(int, time.Duration) (<-chan time.Time, func()) {
 		return ticks, func() {}
@@ -215,6 +218,13 @@ func TestCompletionAndTickRecoverFromPanics(t *testing.T) {
 
 	await(t, tickContinued)
 	waitForShardTask(t, d)
+	wantPanics := []string{"completion panic", "tick panic"}
+	if len(panicLog.errors) != len(wantPanics) {
+		t.Fatalf("logged panic errors = %v, want %v", panicLog.errors, wantPanics)
+	}
+	for index, want := range wantPanics {
+		assertWorkPanicError(t, panicLog.errors[index], want)
+	}
 	assertDispatchMetric(t, deps.Metrics, `yabot_dispatch_panics_total{route="none"}`, 2)
 	assertDispatchMetric(t, deps.Metrics, ticketsInUseMetric, 0)
 }
@@ -237,6 +247,7 @@ func TestRunOnAllReportsAbnormalTaskExit(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 				defer cancel()
 				err := d.RunOnAll(ctx, func(context.Context, *Shard, func(error)) { tc.exit() })
+				assertWorkPanicError(t, err, nil)
 				if err == nil || !strings.Contains(err.Error(), "task panicked: <nil>") {
 					t.Errorf("RunOnAll = %v, want a panic error with a nil value", err)
 				}
@@ -247,6 +258,39 @@ func TestRunOnAllReportsAbnormalTaskExit(t *testing.T) {
 			})
 		})
 	}
+}
+
+func assertWorkPanicError(t *testing.T, err error, wantValue any) {
+	t.Helper()
+	var panicErr *PanicError
+	if !errors.As(err, &panicErr) || panicErr == nil {
+		t.Fatalf("panic error = %v (%T), want *PanicError", err, err)
+	}
+	if panicErr.Value != wantValue || len(panicErr.Stack) == 0 {
+		t.Errorf("panic value = %v, stack size = %d, want value %v and a stack", panicErr.Value, len(panicErr.Stack), wantValue)
+	}
+}
+
+type workPanicLog struct {
+	slog.Handler
+	errors []error
+}
+
+func (*workPanicLog) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelError
+}
+
+func (log *workPanicLog) Handle(_ context.Context, record slog.Record) error {
+	var err error
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key != "error" {
+			return true
+		}
+		err, _ = attr.Value.Any().(error)
+		return false
+	})
+	log.errors = append(log.errors, err)
+	return nil
 }
 
 func startWithTestTicks(t *testing.T, deps Deps, callbacks ...Task) *Dispatcher {

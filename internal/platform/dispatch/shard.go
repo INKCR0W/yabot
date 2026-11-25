@@ -11,6 +11,7 @@ import (
 
 type shardContextKey struct{}
 
+// Shard mailbox methods require the owning goroutine and panic on keys from other shards.
 type Shard struct {
 	dispatcher  *Dispatcher
 	index       int
@@ -18,7 +19,11 @@ type Shard struct {
 	completions chan Task
 	ticketFreed chan struct{}
 	inUse       atomic.Int64
-	ready       []work
+	ready       []readyItem
+	runCtx      context.Context
+	mailboxes   map[Key]*mailbox
+	retries     map[Key]time.Time
+	exiting     bool
 }
 
 func newShard(d *Dispatcher, index int) *Shard {
@@ -28,6 +33,8 @@ func newShard(d *Dispatcher, index int) *Shard {
 		inbox:       make(chan work, d.deps.Inbox),
 		completions: make(chan Task, d.deps.TicketsPerShard),
 		ticketFreed: make(chan struct{}, 1),
+		mailboxes:   make(map[Key]*mailbox),
+		retries:     make(map[Key]time.Time),
 	}
 }
 
@@ -35,10 +42,12 @@ func (sh *Shard) Index() int { return sh.index }
 
 func (sh *Shard) run(ctx context.Context) {
 	ctx = context.WithValue(ctx, shardContextKey{}, true)
+	sh.runCtx = ctx
 	ticks, stop := sh.dispatcher.deps.NewTicker(sh.index, sh.dispatcher.deps.Tick)
 	if stop != nil {
 		defer stop()
 	}
+	defer sh.abortMailboxes()
 	closing := sh.dispatcher.closing
 	var tick time.Time
 	var inboxItem work
@@ -121,10 +130,12 @@ func (sh *Shard) runCompletion(ctx context.Context, fn Task) {
 	sh.runWork(ctx, work{task: fn})
 }
 
-func (sh *Shard) runTick(ctx context.Context, now time.Time) {
+func (sh *Shard) runTick(ctx context.Context, _ time.Time) {
 	for _, fn := range sh.dispatcher.tickFns {
 		sh.execute(ctx, work{task: fn})
 	}
+	// Tick callbacks finish before due replays are released.
+	sh.releaseDueReplays()
 	sh.drainReady(ctx)
 }
 
@@ -136,9 +147,9 @@ func (sh *Shard) runWork(ctx context.Context, item work) {
 func (sh *Shard) drainReady(ctx context.Context) {
 	for len(sh.ready) > 0 {
 		item := sh.ready[0]
-		sh.ready[0] = work{}
+		sh.ready[0] = readyItem{}
 		sh.ready = sh.ready[1:]
-		sh.execute(ctx, item)
+		sh.runReadyItem(ctx, item)
 	}
 }
 
@@ -147,15 +158,30 @@ func (sh *Shard) execute(ctx context.Context, item work) {
 	defer func() {
 		if !returned {
 			// Goexit also reports a nil value here and still terminates the shard goroutine.
-			value := recover()
-			sh.reportPanic(ctx, item, value)
+			err := &PanicError{Shard: sh.index, Value: recover(), Stack: debug.Stack()}
+			sh.reportPanic(ctx, item, err)
+			if item.onPanic != nil {
+				sh.execute(ctx, work{key: item.key, route: item.route, task: func(context.Context, *Shard) {
+					item.onPanic(err)
+				}})
+			}
 		}
 	}()
 	item.task(ctx, sh)
 	returned = true
 }
 
-func (sh *Shard) reportPanic(ctx context.Context, item work, value any) {
+type PanicError struct {
+	Shard int
+	Value any
+	Stack []byte
+}
+
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("dispatch: shard %d task panicked: %v", e.Shard, e.Value)
+}
+
+func (sh *Shard) reportPanic(ctx context.Context, item work, err *PanicError) {
 	d := sh.dispatcher
 	route := item.route
 	counter := d.panics
@@ -169,8 +195,5 @@ func (sh *Shard) reportPanic(ctx context.Context, item work, value any) {
 		counter.Inc()
 	}
 	d.deps.Log.ErrorContext(ctx, "dispatch task panicked", "shard", sh.index, "key", item.key, "route", route,
-		"panic", value, "stack", string(debug.Stack()))
-	if item.onPanic != nil {
-		item.onPanic(fmt.Errorf("dispatch: shard %d task panicked: %v", sh.index, value))
-	}
+		"panic", err.Value, "stack", string(err.Stack), "error", err)
 }

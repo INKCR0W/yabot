@@ -224,7 +224,8 @@ func TestTaskPanic(t *testing.T) {
 	deps.Metrics = metrics.NewSet()
 	d := startTestDispatcher(t, deps)
 	key := Key{Space: 17, A: -12, B: 19}
-	if err := d.Submit(key, func(context.Context, *Shard) { panic("failed task") }); err != nil {
+	panics := make(chan error, 1)
+	if err := d.submit(key, "", func(context.Context, *Shard) { panic("failed task") }, func(err error) { panics <- err }); err != nil {
 		t.Fatal(err)
 	}
 	processed := make(chan struct{})
@@ -232,6 +233,7 @@ func TestTaskPanic(t *testing.T) {
 		t.Fatal(err)
 	}
 	await(t, processed)
+	assertWorkPanicError(t, await(t, panics), "failed task")
 
 	var record struct {
 		Level string

@@ -14,9 +14,9 @@ type ticketState struct {
 	claimed atomic.Bool
 }
 
-// Admit must be called on the shard goroutine.
+// Admit must be called on the shard goroutine. It returns false during exit cleanup.
 func (sh *Shard) Admit() (Ticket, bool) {
-	if sh.inUse.Load() >= int64(cap(sh.completions)) {
+	if sh.exiting || sh.inUse.Load() >= int64(cap(sh.completions)) {
 		return Ticket{}, false
 	}
 	sh.inUse.Add(1)
