@@ -60,7 +60,7 @@ recent_closed_ttl = "10m"
 blacklist = []                # User IDs blocked across all chats.
 
 [turnstile]
-site_key = ""
+site_key = ""                 # Required and public. Set it here. No environment override.
 secret = ""                   # Override with YABOT_TURNSTILE_SECRET.
 hostname = "yabot.example.com"
 timeout = "3s"

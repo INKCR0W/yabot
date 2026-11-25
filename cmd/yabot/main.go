@@ -123,8 +123,11 @@ func checkTelegram(parent context.Context, client *telegram.Client, skew *telegr
 			return false, true
 		}
 		message := "Telegram getMe failed"
-		if errors.Is(err, bot.ErrorUnauthorized) {
+		switch {
+		case errors.Is(err, bot.ErrorUnauthorized):
 			message = "Telegram getMe failed: invalid bot token (401 Unauthorized)"
+		case errors.Is(err, bot.ErrorNotFound):
+			message = "Telegram getMe failed: malformed bot token or incorrect telegram.api_server (404 Not Found)"
 		}
 		logger.ErrorContext(ctx, message, "class", outcome.Class.String(), "error", err)
 		return false, false
