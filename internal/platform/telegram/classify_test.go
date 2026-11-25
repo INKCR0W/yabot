@@ -89,23 +89,6 @@ func TestClassifyTelegramResponses(t *testing.T) {
 	}
 }
 
-func TestClassifyUpstreamBadGateway(t *testing.T) {
-	server := newBotTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		writeTestResponse(t, w, `{"ok":false,"error_code":502,"description":"Bad Gateway"}`)
-	}))
-	t.Cleanup(server.Close)
-	upstream, err := bot.New(testToken, bot.WithSkipGetMe(), bot.WithServerURL(server.URL), bot.WithHTTPClient(0, &http.Client{}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = upstream.GetMe(t.Context())
-	if got := Classify(err).Class; got != Retry {
-		t.Errorf("Classify(%v) = %s, want %s", err, got, Retry)
-	}
-}
-
 func TestClassifyDistinguishesChatAndRequestErrors(t *testing.T) {
 	cases := []struct {
 		description string
@@ -171,9 +154,9 @@ func TestOutcomeZeroValueAndErrorCause(t *testing.T) {
 
 func botResponseError(t *testing.T, status int, description string, parameters map[string]int64) error {
 	t.Helper()
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	transport := testResponseTransport(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/bot"+testToken+"/approveChatJoinRequest" {
-			t.Error("expected an approveChatJoinRequest call")
+			t.Fatal("expected an approveChatJoinRequest call")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -185,8 +168,9 @@ func botResponseError(t *testing.T, status int, description string, parameters m
 		}); err != nil {
 			t.Error(err)
 		}
-	}, nil)
-	_, err := client.Bot.ApproveChatJoinRequest(t.Context(), &bot.ApproveChatJoinRequestParams{
+	})
+	upstream := newUpstreamTestBot(t, transport)
+	_, err := upstream.ApproveChatJoinRequest(t.Context(), &bot.ApproveChatJoinRequestParams{
 		ChatID: -123, UserID: 456,
 	})
 	if err == nil {

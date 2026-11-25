@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -121,7 +122,7 @@ func Classify(err error) Outcome {
 	}
 	var rateLimited *bot.TooManyRequestsError
 	if errors.As(err, &rateLimited) {
-		return Outcome{Class: Retry, RetryAfter: time.Duration(rateLimited.RetryAfter) * time.Second}
+		return Outcome{Class: Retry, RetryAfter: retryAfterDuration(uint64(max(0, rateLimited.RetryAfter)))}
 	}
 	var migrated *bot.MigrateError
 	if errors.As(err, &migrated) {
@@ -151,6 +152,13 @@ func Classify(err error) Outcome {
 		return Outcome{Class: Retry}
 	}
 	return Outcome{Class: Fatal}
+}
+
+func retryAfterDuration(seconds uint64) time.Duration {
+	if seconds > uint64(math.MaxInt64/time.Second) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 const apiErrorPrefix = "error response from telegram for method "

@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -72,9 +74,10 @@ func TestGetUpdatesRequestAndDecode(t *testing.T) {
 }
 
 func TestGetUpdatesRejectsInvalidLimit(t *testing.T) {
-	client, _ := newTestClient(t, func(http.ResponseWriter, *http.Request) {
+	transport := testResponseTransport(t, func(http.ResponseWriter, *http.Request) {
 		t.Error("invalid limit reached the Bot API")
-	}, nil)
+	})
+	client := newMemoryTestClient(t, transport)
 	for _, limit := range []int{0, 101} {
 		if _, err := client.GetUpdates(t.Context(), 0, limit, 0, nil); err == nil || !strings.Contains(err.Error(), "limit") || strings.Contains(err.Error(), testToken) {
 			t.Errorf("limit %d: got %v, want a safe limit error", limit, err)
@@ -101,21 +104,10 @@ func TestGetUpdatesErrorParity(t *testing.T) {
 		{502, `"description":"Bad Gateway"`, Outcome{Class: Retry}, nil},
 	} {
 		t.Run(fmt.Sprintf("%d_%s", tc.code, tc.want.Class), func(t *testing.T) {
-			client, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tc.code)
-				writeTestResponse(t, w, fmt.Sprintf(`{"ok":false,"error_code":%d,%s}`, tc.code, tc.fields))
-			}, nil)
-			_, err := client.GetUpdates(t.Context(), 0, 100, 0, nil)
-			_, upstream := client.Bot.GetMe(t.Context())
-			if err == nil || upstream == nil || strings.Contains(err.Error(), testToken) {
-				t.Fatalf("GetUpdates error=%v, library error=%v", err, upstream)
-			}
-			libraryAPIError := upstream
-			if tc.code >= 500 {
-				libraryAPIError = errors.Unwrap(upstream)
-			}
-			if libraryAPIError == nil || reflect.TypeOf(err) != reflect.TypeOf(libraryAPIError) ||
-				err.Error() != strings.Replace(libraryAPIError.Error(), "for method getMe,", "for method getUpdates,", 1) {
+			body := fmt.Sprintf(`{"ok":false,"error_code":%d,%s}`, tc.code, tc.fields)
+			err, upstream := getUpdatesErrors(t, tc.code, body)
+			if reflect.TypeOf(err) != reflect.TypeOf(upstream) ||
+				err.Error() != strings.Replace(upstream.Error(), "for method getMe,", "for method getUpdates,", 1) {
 				t.Errorf("GetUpdates: %T %v, library: %T %v", err, err, upstream, upstream)
 			}
 			if got := Classify(upstream); got != tc.want {
@@ -126,6 +118,45 @@ func TestGetUpdatesErrorParity(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetUpdatesNonJSONGatewayErrors(t *testing.T) {
+	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			err, upstream := getUpdatesErrors(t, status, "upstream unavailable")
+			wantLocal := fmt.Sprintf("error response from telegram for method getUpdates, %d %s", status, http.StatusText(status))
+			if err.Error() != wantLocal || errors.Unwrap(err) != nil || Classify(err).Class != Retry {
+				t.Errorf("GetUpdates error = %T %v, want a retryable status error %q", err, err, wantLocal)
+			}
+			wantUpstream := "error decode response body for method getMe, upstream unavailable, invalid character 'u' looking for beginning of value"
+			if _, ok := errors.AsType[*json.SyntaxError](upstream); !ok || upstream.Error() != wantUpstream ||
+				reflect.TypeOf(err) == reflect.TypeOf(upstream) || Classify(upstream).Class != Fatal {
+				t.Errorf("native error = %T %v, want a distinct JSON syntax error %q", upstream, upstream, wantUpstream)
+			}
+		})
+	}
+}
+
+func getUpdatesErrors(t *testing.T, status int, body string) (raw, native error) {
+	t.Helper()
+	var requests []string
+	transport := testResponseTransport(t, func(w http.ResponseWriter, req *http.Request) {
+		requests = append(requests, req.URL.Path)
+		w.WriteHeader(status)
+		writeTestResponse(t, w, body)
+	})
+	client := newMemoryTestClient(t, transport)
+	upstream := newUpstreamTestBot(t, transport)
+	_, raw = client.GetUpdates(t.Context(), 0, 100, 0, nil)
+	// The pinned library's polling method is private.
+	_, native = upstream.GetMe(t.Context())
+	if want := []string{"/bot" + testToken + "/getUpdates", "/bot" + testToken + "/getMe"}; !slices.Equal(requests, want) {
+		t.Fatalf("transport received %d requests, want getUpdates followed by native getMe", len(requests))
+	}
+	if raw == nil || native == nil || strings.Contains(raw.Error(), testToken) {
+		t.Fatalf("GetUpdates error=%v, library error=%v", raw, native)
+	}
+	return raw, native
 }
 
 func TestGetUpdatesResponseFailure(t *testing.T) {
@@ -140,18 +171,21 @@ func TestGetUpdatesResponseFailure(t *testing.T) {
 		{"non-JSON 502", "upstream timed out: " + testToken, 502, false, Retry},
 		{"oversize", "", 200, true, Fatal},
 		{"oversize 502", "", 502, true, Retry},
+		{"null result", `{"ok":true,"result":null}`, 200, false, Fatal},
+		{"object result", `{"ok":true,"result":{}}`, 200, false, Fatal},
 		{"no update ID", `{"ok":true,"result":[{"chat_join_request":"bad"}]}`, 200, false, Fatal},
 		{"invalid update ID", `{"ok":true,"result":[{"update_id":"bad","chat_join_request":"bad"}]}`, 200, false, Fatal},
 		{"too many entries", `{"ok":true,"result":[{"update_id":1},{"update_id":2}]}`, 200, false, Fatal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			transport := testResponseTransport(t, func(w http.ResponseWriter, _ *http.Request) {
 				if tc.oversize {
 					w.Header().Set("Content-Length", "67108865")
 				}
 				w.WriteHeader(tc.status)
 				writeTestResponse(t, w, tc.body)
-			}, nil)
+			})
+			client := newMemoryTestClient(t, transport)
 			updates, err := client.GetUpdates(t.Context(), 0, 1, 0, nil)
 			if updates != nil || err == nil || strings.Contains(err.Error(), testToken) || strings.Contains(err.Error(), url.QueryEscape(testToken)) || Classify(err).Class != tc.want {
 				t.Fatalf("GetUpdates = (%+v, %v), want safe %s error", updates, err, tc.want)
@@ -179,12 +213,14 @@ func TestGetUpdatesFallsBackToHTTPStatus(t *testing.T) {
 		{401, `{"ok":false,"error_code":401,"description":123}`, Outcome{Class: Unauthorized}, bot.ErrorUnauthorized},
 		{409, `{"error":"another worker owns this route"}`, Outcome{Class: Conflict}, bot.ErrorConflict},
 		{403, `{"ok":true,"result":[]}`, Outcome{Class: Forbidden}, bot.ErrorForbidden},
+		{403, `{"ok":true,"error_code":403,"result":[]}`, Outcome{Class: Forbidden}, bot.ErrorForbidden},
 	} {
 		t.Run(fmt.Sprintf("%d_%s", tc.status, tc.want.Class), func(t *testing.T) {
-			client, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			transport := testResponseTransport(t, func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tc.status)
 				writeTestResponse(t, w, tc.body)
-			}, nil)
+			})
+			client := newMemoryTestClient(t, transport)
 			updates, err := client.GetUpdates(t.Context(), 0, 1, 0, nil)
 			if updates != nil || err == nil || strings.Contains(err.Error(), testToken) {
 				t.Fatal("expected a safe HTTP status error")
@@ -245,6 +281,7 @@ func TestGetUpdatesPreservesHTTPStatusWhenBodyIsTruncated(t *testing.T) {
 }
 
 func TestRateLimitResponse(t *testing.T) {
+	const maxDuration = time.Duration(math.MaxInt64)
 	for _, call := range []struct {
 		name string
 		do   func(context.Context, *Client) error
@@ -253,40 +290,65 @@ func TestRateLimitResponse(t *testing.T) {
 			_, err := c.GetUpdates(ctx, 0, 1, 0, nil)
 			return err
 		}},
+		{"GetMe", func(ctx context.Context, c *Client) error {
+			_, err := c.GetMe(ctx)
+			return err
+		}},
 		{"Bot.GetMe", func(ctx context.Context, c *Client) error {
 			_, err := c.Bot.GetMe(ctx)
 			return err
 		}},
 	} {
 		for _, tc := range []struct {
-			name, body string
-			truncated  bool
-			want       int
+			name, body, header string
+			truncated          bool
+			want               time.Duration
 		}{
-			{"malformed JSON", `{"ok":`, false, 37},
-			{"truncated body", `{"ok":`, true, 37},
-			{"Telegram retry_after", `{"ok":false,"error_code":429,"parameters":{"retry_after":12}}`, false, 12},
+			{"malformed JSON", `{"ok":`, "37", false, 37 * time.Second},
+			{"truncated body", `{"ok":`, "37", true, 37 * time.Second},
+			{"Telegram retry_after", `{"ok":false,"error_code":429,"parameters":{"retry_after":12}}`, "37", false, 12 * time.Second},
+			{"missing retry_after", `{"ok":false,"error_code":429}`, "37", false, 37 * time.Second},
+			{"zero retry_after", `{"ok":false,"error_code":429,"parameters":{"retry_after":0}}`, "37", false, 37 * time.Second},
+			{"negative retry_after", `{"ok":false,"error_code":429,"parameters":{"retry_after":-5}}`, "37", false, 37 * time.Second},
+			{"default", `{"ok":false,"error_code":429}`, "", false, time.Second},
+			{"zero header", `{"ok":false,"error_code":429}`, "0", false, 0},
+			{"largest whole seconds", `{"ok":false,"error_code":429,"parameters":{"retry_after":9223372036}}`, "37", false, 9223372036 * time.Second},
+			{"first overflowing body", `{"ok":false,"error_code":429,"parameters":{"retry_after":9223372037}}`, "37", false, maxDuration},
+			{"huge body", `{"ok":false,"error_code":429,"parameters":{"retry_after":18446744073709551616}}`, "37", false, maxDuration},
+			{"first overflowing header", `{"ok":false,"error_code":429}`, "9223372037", false, maxDuration},
+			{"huge header", `{"ok":false,"error_code":429}`, "18446744073709551616", false, maxDuration},
 		} {
 			t.Run(call.name+"/"+tc.name, func(t *testing.T) {
-				client, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-					w.Header().Set("Retry-After", "37")
+				handler := func(w http.ResponseWriter, _ *http.Request) {
+					if tc.header != "" {
+						w.Header().Set("Retry-After", tc.header)
+					}
 					if tc.truncated {
 						w.Header().Set("Content-Length", "32")
 						w.Header().Set("Connection", "close")
 					}
 					w.WriteHeader(http.StatusTooManyRequests)
 					writeTestResponse(t, w, tc.body)
-				}, nil)
+				}
+				var client *Client
+				if tc.truncated {
+					client, _ = newTestClient(t, handler, nil)
+				} else {
+					client = newMemoryTestClient(t, testResponseTransport(t, handler))
+				}
 
 				err := call.do(t.Context(), client)
 				var rateLimited *bot.TooManyRequestsError
-				if !errors.As(err, &rateLimited) || rateLimited.RetryAfter != tc.want {
-					t.Errorf("error = %v, want TooManyRequestsError with a %d-second delay", err, tc.want)
+				if !errors.As(err, &rateLimited) {
+					t.Errorf("error = %T %v, want TooManyRequestsError", err, err)
+				} else if seconds := tc.want / time.Second; tc.want != maxDuration && seconds <= math.MaxInt &&
+					rateLimited.RetryAfter != int(seconds) {
+					t.Errorf("RetryAfter = %d seconds, want %d", rateLimited.RetryAfter, seconds)
 				}
 				if tc.truncated && !errors.Is(err, io.ErrUnexpectedEOF) {
 					t.Errorf("error = %v, want unexpected EOF", err)
 				}
-				want := Outcome{Class: Retry, RetryAfter: time.Duration(tc.want) * time.Second}
+				want := Outcome{Class: Retry, RetryAfter: tc.want}
 				if got := Classify(err); got != want {
 					t.Errorf("Classify(%v) = %+v, want %+v", err, got, want)
 				}
@@ -299,7 +361,7 @@ func TestRetryAfterSeconds(t *testing.T) {
 	now := time.Date(2026, time.November, 25, 12, 0, 0, 250_000_000, time.UTC)
 	for _, tc := range []struct {
 		name, header string
-		want         int
+		want         uint64
 	}{
 		{"seconds", "37", 37},
 		{"zero", "0", 0},
@@ -416,9 +478,10 @@ func TestGetMeRejectsInvalidResult(t *testing.T) {
 		{"null id", `{"id":null,"username":"guard_bot"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			transport := testResponseTransport(t, func(w http.ResponseWriter, _ *http.Request) {
 				writeTestResponse(t, w, `{"ok":true,"result":`+tc.result+`}`)
-			}, nil)
+			})
+			client := newMemoryTestClient(t, transport)
 			me, err := client.GetMe(t.Context())
 			if !reflect.DeepEqual(me, Me{}) || Classify(err).Class != Fatal {
 				t.Fatalf("GetMe = (%+v, %v), want zero Me and a fatal error", me, err)

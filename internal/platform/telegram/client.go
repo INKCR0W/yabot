@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -167,11 +168,16 @@ func (b botHTTPClient) Do(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		// Let the library return its native error for a valid Telegram response.
+		// The library cannot apply the header fallback or saturate huge values, so build its error here.
+		if envelope.ErrorCode == http.StatusTooManyRequests {
+			if seconds := envelope.retryAfter(resp); envelope.Parameters.RetryAfter == 0 || seconds > math.MaxInt {
+				return nil, envelope.apiError(method, seconds, c.token)
+			}
+		}
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return resp, nil
 	}
-	return nil, envelope.apiError(method)
+	return nil, envelope.apiError(method, envelope.retryAfter(resp), c.token)
 }
 
 const (

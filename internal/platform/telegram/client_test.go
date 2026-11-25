@@ -2,20 +2,69 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"testing/iotest"
 	"time"
+
+	"github.com/go-telegram/bot"
 )
 
-const testToken = "123456:fake-YABOT-test-credential_X9k"
+const (
+	testToken     = "123456:fake-YABOT-test-credential_X9k"
+	testBotAPIURL = "http://bot.test"
+)
+
+type testRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func testResponseTransport(t *testing.T, handler http.HandlerFunc) http.RoundTripper {
+	t.Helper()
+	return testRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if req.Body != nil {
+			defer func() {
+				if err := req.Body.Close(); err != nil {
+					t.Errorf("close test request body: %v", err)
+				}
+			}()
+		}
+		recorder := httptest.NewRecorder()
+		handler(recorder, req)
+		return recorder.Result(), nil
+	})
+}
+
+func newMemoryTestClient(t *testing.T, transport http.RoundTripper) *Client {
+	t.Helper()
+	client, err := New(Config{Token: testToken, ServerURL: testBotAPIURL, Skew: NewTimeSkew(nil, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.http.Transport = transport
+	return client
+}
+
+func newUpstreamTestBot(t *testing.T, transport http.RoundTripper) *bot.Bot {
+	t.Helper()
+	upstream, err := bot.New(testToken, bot.WithSkipGetMe(), bot.WithServerURL(testBotAPIURL),
+		bot.WithHTTPClient(0, &http.Client{Transport: transport}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return upstream
+}
 
 func newTestClient(t *testing.T, handler http.HandlerFunc, log *slog.Logger) (*Client, *TimeSkew) {
 	t.Helper()
@@ -146,6 +195,104 @@ func TestGetUpdatesUsesSharedConnectionWithoutAffectingSkew(t *testing.T) {
 		if got := <-addresses; got != addr {
 			t.Errorf("getUpdates connection = %s, library connection = %s", got, addr)
 		}
+	}
+}
+
+func TestGetMeErrorResponses(t *testing.T) {
+	for _, call := range []struct {
+		name string
+		do   func(context.Context, *Client) error
+	}{
+		{"Bot.GetMe", func(ctx context.Context, c *Client) error {
+			_, err := c.Bot.GetMe(ctx)
+			return err
+		}},
+		{"GetMe", func(ctx context.Context, c *Client) error {
+			_, err := c.GetMe(ctx)
+			return err
+		}},
+	} {
+		for _, tc := range []struct {
+			name, body      string
+			status          int
+			want            Class
+			cause           error
+			wantSyntaxError bool
+		}{
+			{"JSON 500", `{"ok":false,"error_code":500,"description":"Internal Server Error"}`, http.StatusInternalServerError, Retry, nil, false},
+			{"JSON 502", `{"ok":false,"error_code":502,"description":"Bad Gateway"}`, http.StatusBadGateway, Retry, nil, false},
+			{"non-JSON 502", "upstream unavailable", http.StatusBadGateway, Retry, nil, false},
+			{"JSON 401", `{"ok":false,"error_code":401,"description":"Unauthorized"}`, http.StatusUnauthorized, Unauthorized, bot.ErrorUnauthorized, false},
+			{"API error on HTTP 200", `{"ok":false,"error_code":409,"description":"Conflict"}`, http.StatusOK, Conflict, bot.ErrorConflict, false},
+			{"API conflict on HTTP 429", `{"ok":false,"error_code":409,"description":"Conflict"}`, http.StatusTooManyRequests, Conflict, bot.ErrorConflict, false},
+			{"malformed JSON on HTTP 200", `{"ok":`, http.StatusOK, Fatal, nil, true},
+		} {
+			t.Run(call.name+"/"+tc.name, func(t *testing.T) {
+				requests := 0
+				client := newMemoryTestClient(t, testResponseTransport(t, func(w http.ResponseWriter, r *http.Request) {
+					requests++
+					if r.Method != http.MethodPost || r.URL.Path != "/bot"+testToken+"/getMe" {
+						t.Error("expected a POST to the getMe API path")
+					}
+					w.WriteHeader(tc.status)
+					writeTestResponse(t, w, tc.body)
+				}))
+
+				err := call.do(t.Context(), client)
+				if requests != 1 {
+					t.Errorf("transport received %d requests, want 1", requests)
+				}
+				want := Outcome{Class: tc.want}
+				if got := Classify(err); got != want {
+					t.Errorf("Classify(%v) = %+v, want %+v", err, got, want)
+				}
+				if tc.cause != nil && !errors.Is(err, tc.cause) {
+					t.Errorf("error = %v, want cause %v", err, tc.cause)
+				}
+				if _, ok := errors.AsType[*json.SyntaxError](err); ok != tc.wantSyntaxError {
+					t.Errorf("error = %v, want JSON syntax error presence %t", err, tc.wantSyntaxError)
+				}
+			})
+		}
+	}
+}
+
+func TestGatewayResponsePreservesReadError(t *testing.T) {
+	for _, call := range []struct {
+		name string
+		do   func(context.Context, *Client) error
+	}{
+		{"Bot.GetMe", func(ctx context.Context, c *Client) error {
+			_, err := c.Bot.GetMe(ctx)
+			return err
+		}},
+		{"GetMe", func(ctx context.Context, c *Client) error {
+			_, err := c.GetMe(ctx)
+			return err
+		}},
+		{"GetUpdates", func(ctx context.Context, c *Client) error {
+			_, err := c.GetUpdates(ctx, 0, 1, 0, nil)
+			return err
+		}},
+	} {
+		t.Run(call.name, func(t *testing.T) {
+			readErr := errors.New("gateway response interrupted")
+			client := newMemoryTestClient(t, testRoundTripper(func(req *http.Request) (*http.Response, error) {
+				if req.Body != nil {
+					if err := req.Body.Close(); err != nil {
+						t.Errorf("close test request body: %v", err)
+					}
+				}
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Body:       io.NopCloser(iotest.ErrReader(readErr)),
+				}, nil
+			}))
+			err := call.do(t.Context(), client)
+			if !errors.Is(err, readErr) || Classify(err).Class != Retry {
+				t.Errorf("error = %v, want a retryable error preserving %v", err, readErr)
+			}
+		})
 	}
 }
 

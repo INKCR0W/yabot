@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -83,9 +84,6 @@ func readUpdateBatch(result json.RawMessage, limit int) ([]json.RawMessage, erro
 	if err != nil {
 		return nil, err
 	}
-	if start == nil {
-		return nil, nil
-	}
 	if start != json.Delim('[') {
 		return nil, errors.New("telegram getUpdates result must be an array")
 	}
@@ -140,9 +138,28 @@ type apiResponse struct {
 	ErrorCode   int             `json:"error_code"`
 	Description string          `json:"description"`
 	Parameters  struct {
-		RetryAfter int `json:"retry_after"`
-		MigrateTo  int `json:"migrate_to_chat_id"`
+		RetryAfter retrySeconds `json:"retry_after"`
+		MigrateTo  int          `json:"migrate_to_chat_id"`
 	} `json:"parameters"`
+}
+
+type retrySeconds uint64
+
+func (s *retrySeconds) UnmarshalJSON(raw []byte) error {
+	value := string(raw)
+	if value == "null" {
+		return nil
+	}
+	magnitude, negative := strings.CutPrefix(value, "-")
+	seconds, ok := parseSeconds(magnitude)
+	if !ok {
+		return errors.New("telegram retry_after must be an integer")
+	}
+	if negative {
+		seconds = 0
+	}
+	*s = retrySeconds(seconds)
+	return nil
 }
 
 func (c *Client) callJSON(ctx context.Context, method string, payload any) (json.RawMessage, error) {
@@ -168,7 +185,7 @@ func (c *Client) callJSON(ctx context.Context, method string, payload any) (json
 		return nil, err
 	}
 	if !envelope.OK {
-		return nil, envelope.apiError(method)
+		return nil, envelope.apiError(method, envelope.retryAfter(resp), c.token)
 	}
 	return envelope.Result, nil
 }
@@ -182,9 +199,6 @@ func (c *Client) decodeAPIResponse(method string, resp *http.Response, body []by
 	}
 	if decodeErr != nil {
 		return apiResponse{}, fmt.Errorf("decode telegram %s response: %w", method, redactError(decodeErr, c.token))
-	}
-	if !envelope.OK {
-		envelope.Description = tokenReplacer(c.token).Replace(envelope.Description)
 	}
 	return envelope, nil
 }
@@ -203,32 +217,51 @@ func readBody(resp *http.Response) (body []byte, err error) {
 	return body, nil
 }
 
-// Match upstream raw_request.go, where migration is a special case of HTTP 400.
-func (r apiResponse) apiError(method string) error {
+func (r apiResponse) retryAfter(resp *http.Response) uint64 {
+	if r.ErrorCode != http.StatusTooManyRequests {
+		return 0
+	}
+	if seconds := uint64(r.Parameters.RetryAfter); seconds > 0 {
+		return seconds
+	}
+	return retryAfterSeconds(resp.Header.Get("Retry-After"), time.Now())
+}
+
+func (r apiResponse) apiError(method string, seconds uint64, token string) error {
+	description := r.Description
+	if token != "" {
+		description = tokenReplacer(token).Replace(description)
+	}
 	switch r.ErrorCode {
 	case http.StatusBadRequest:
+		// Upstream only recognizes migration parameters on HTTP 400.
 		if r.Parameters.MigrateTo != 0 {
 			return &bot.MigrateError{
-				Message:         fmt.Sprintf("%s: %s", bot.ErrorBadRequest, r.Description),
+				Message:         fmt.Sprintf("%s: %s", bot.ErrorBadRequest, description),
 				MigrateToChatID: r.Parameters.MigrateTo,
 			}
 		}
-		return fmt.Errorf("%w, %s", bot.ErrorBadRequest, r.Description)
+		return fmt.Errorf("%w, %s", bot.ErrorBadRequest, description)
 	case http.StatusUnauthorized:
-		return fmt.Errorf("%w, %s", bot.ErrorUnauthorized, r.Description)
+		return fmt.Errorf("%w, %s", bot.ErrorUnauthorized, description)
 	case http.StatusForbidden:
-		return fmt.Errorf("%w, %s", bot.ErrorForbidden, r.Description)
+		return fmt.Errorf("%w, %s", bot.ErrorForbidden, description)
 	case http.StatusNotFound:
-		return fmt.Errorf("%w, %s", bot.ErrorNotFound, r.Description)
+		return fmt.Errorf("%w, %s", bot.ErrorNotFound, description)
 	case http.StatusConflict:
-		return fmt.Errorf("%w, %s", bot.ErrorConflict, r.Description)
+		return fmt.Errorf("%w, %s", bot.ErrorConflict, description)
 	case http.StatusTooManyRequests:
-		return &bot.TooManyRequestsError{
-			Message:    fmt.Sprintf("%s, %s", bot.ErrorTooManyRequests, r.Description),
-			RetryAfter: r.Parameters.RetryAfter,
+		err := &bot.TooManyRequestsError{
+			Message:    fmt.Sprintf("%s, %s", bot.ErrorTooManyRequests, description),
+			RetryAfter: int(min(seconds, math.MaxInt)),
 		}
+		if seconds > math.MaxInt {
+			// Keep the duration when the library's int field cannot hold the seconds.
+			return &Error{Outcome: Outcome{Class: Retry, RetryAfter: retryAfterDuration(seconds)}, Err: err}
+		}
+		return err
 	default:
-		return ordinaryAPIError(method, r.ErrorCode, r.Description)
+		return ordinaryAPIError(method, r.ErrorCode, description)
 	}
 }
 
@@ -239,10 +272,7 @@ func ordinaryAPIError(method string, code int, description string) error {
 func httpStatusError(method string, resp *http.Response) error {
 	status := resp.StatusCode
 	fallback := apiResponse{ErrorCode: status, Description: http.StatusText(status)}
-	if status == http.StatusTooManyRequests {
-		fallback.Parameters.RetryAfter = retryAfterSeconds(resp.Header.Get("Retry-After"), time.Now())
-	}
-	return fallback.apiError(method)
+	return fallback.apiError(method, fallback.retryAfter(resp), "")
 }
 
 func withHTTPStatusError(method string, resp *http.Response, err error) error {
@@ -252,12 +282,10 @@ func withHTTPStatusError(method string, resp *http.Response, err error) error {
 	return errors.Join(httpStatusError(method, resp), err)
 }
 
-func retryAfterSeconds(value string, now time.Time) int {
-	const maxSeconds = min(1<<(strconv.IntSize-1)-1, (1<<63-1)/uint64(time.Second))
+func retryAfterSeconds(value string, now time.Time) uint64 {
 	value = strings.TrimSpace(value)
-	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil ||
-		(errors.Is(err, strconv.ErrRange) && strings.Trim(value, "0123456789") == "") {
-		return int(min(seconds, maxSeconds))
+	if seconds, ok := parseSeconds(value); ok {
+		return seconds
 	}
 	retryAt, err := http.ParseTime(value)
 	if err != nil {
@@ -268,5 +296,10 @@ func retryAfterSeconds(value string, now time.Time) int {
 	if delay%time.Second != 0 {
 		seconds++
 	}
-	return int(min(seconds, maxSeconds))
+	return seconds
+}
+
+func parseSeconds(value string) (uint64, bool) {
+	seconds, err := strconv.ParseUint(value, 10, 64)
+	return seconds, err == nil || (errors.Is(err, strconv.ErrRange) && strings.Trim(value, "0123456789") == "")
 }
