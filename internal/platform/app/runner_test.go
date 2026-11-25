@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -91,18 +92,38 @@ func TestRunRollsBackStartFailure(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var log bytes.Buffer
 			calls := make(callLog, 8)
-			runner := testRunner(&log)
+			runner := NewRunner(slog.New(slog.NewJSONHandler(&log, nil)))
+			var contexts []context.Context
+			recordStart := func(ctx context.Context) error {
+				contexts = append(contexts, ctx)
+				return nil
+			}
+			checkContexts := func(context.Context) error {
+				for i, ctx := range contexts {
+					if ctx.Err() != context.Canceled {
+						t.Errorf("Start context for component at index %d has error %v when rollback begins, want context.Canceled", i, ctx.Err())
+					}
+				}
+				return nil
+			}
 			err := runner.Run(t.Context(),
-				calls.component("A", nil, nil), calls.component("B", nil, nil),
+				calls.component("A", recordStart, nil), calls.component("B", recordStart, checkContexts),
 				calls.component("C", tc.start, nil), calls.component("D", nil, nil),
 			)
 			assertComponentError(t, err, "C", tc.wantErr)
+			loggedError := tc.wantErr.Error()
 			if tc.name == "panic" {
 				const wantError = `start component "C": panic: broken setup`
 				if err.Error() != wantError {
 					t.Errorf("Run = %q, want %q", err, wantError)
 				}
-				assertPanicStack(t, log.String(), "TestRunRollsBackStartFailure")
+				loggedError = "panic: " + loggedError
+			}
+			record := assertLogRecord(t, &log, map[string]string{
+				"level": "ERROR", "msg": "component start failed", "component": "C", "error": loggedError,
+			})
+			if tc.name == "panic" {
+				assertPanicStack(t, record, "TestRunRollsBackStartFailure")
 			}
 			calls.check(t, "start A", "start B", "start C", "stop B", "stop A")
 		})
@@ -436,7 +457,7 @@ func TestFatalDuringAndAfterShutdown(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		var log bytes.Buffer
-		runner := testRunner(&log)
+		runner := NewRunner(slog.New(slog.NewJSONHandler(&log, nil)))
 		report := runner.Fatal()
 		started := make(chan struct{})
 		stopping := make(chan struct{})
@@ -460,9 +481,9 @@ func TestFatalDuringAndAfterShutdown(t *testing.T) {
 		assertComponentError(t, <-result, "worker", during)
 		report("worker", errors.New("after Run"))
 		synctest.Wait()
-		if !strings.Contains(log.String(), `level=ERROR msg="ignored fatal reports"`) || !strings.Contains(log.String(), "after Run") {
-			t.Errorf("Fatal after Run missing from Error logs: %s", &log)
-		}
+		assertLogRecord(t, &log, map[string]string{
+			"level": "ERROR", "msg": "ignored fatal reports", "example_component": "worker", "example_error": "after Run",
+		})
 	})
 }
 
@@ -564,7 +585,7 @@ func TestRunContinuesAfterStopFailure(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				var log bytes.Buffer
-				runner := testRunner(&log)
+				runner := NewRunner(slog.New(slog.NewJSONHandler(&log, nil)))
 				fatal := runner.Fatal()
 				primary := errors.New("primary failure")
 				calls := make(callLog, 4)
@@ -579,11 +600,15 @@ func TestRunContinuesAfterStopFailure(t *testing.T) {
 				}
 				calls.check(t, "start A", "start B", "stop B", "stop A")
 				synctest.Wait()
-				if !strings.Contains(log.String(), "level=ERROR") || !strings.Contains(log.String(), cause.Error()) {
-					t.Errorf("Stop failure missing from Error logs: %s", &log)
-				}
+				loggedError := cause.Error()
 				if tc.name == "panic" {
-					assertPanicStack(t, log.String(), "TestRunContinuesAfterStopFailure")
+					loggedError = "panic: " + loggedError
+				}
+				record := assertLogRecord(t, &log, map[string]string{
+					"level": "ERROR", "msg": "component stop failed", "component": "B", "error": loggedError,
+				})
+				if tc.name == "panic" {
+					assertPanicStack(t, record, "TestRunContinuesAfterStopFailure")
 				}
 			})
 		})
@@ -598,7 +623,7 @@ func TestRunAbandonsTimedOutStop(t *testing.T) {
 		defer cancel()
 		unblock := make(chan struct{})
 		var log bytes.Buffer
-		runner := testRunner(&log)
+		runner := NewRunner(slog.New(slog.NewJSONHandler(&log, nil)))
 		report := runner.Fatal()
 		late := errors.New("fatal from abandoned Stop")
 		const timeout = 25 * time.Millisecond
@@ -643,12 +668,12 @@ func TestRunAbandonsTimedOutStop(t *testing.T) {
 			t.Errorf("second deadline %v must be after first deadline %v", second, first)
 		}
 		calls.check(t, "start A", "start B", "stop B", "stop A")
-		if !strings.Contains(log.String(), `level=ERROR msg="component stop timed out"`) {
-			t.Errorf("Stop timeout missing from Error logs: %s", &log)
-		}
-		if !strings.Contains(log.String(), `level=ERROR msg="ignored fatal reports"`) || !strings.Contains(log.String(), late.Error()) {
-			t.Errorf("Fatal from abandoned Stop missing from Error logs: %s", &log)
-		}
+		assertLogRecord(t, &log, map[string]string{
+			"level": "ERROR", "msg": "component stop timed out", "component": "B", "error": context.DeadlineExceeded.Error(),
+		})
+		assertLogRecord(t, &log, map[string]string{
+			"level": "ERROR", "msg": "ignored fatal reports", "example_component": "B", "example_error": late.Error(),
+		})
 	})
 }
 
@@ -707,6 +732,27 @@ func TestRunnerRejectsInvalidRun(t *testing.T) {
 				if err := runner.Run(ctx, a); err == nil || !strings.Contains(err.Error(), "only run once") {
 					t.Errorf("second Run = %v, want run-once error", err)
 				}
+			}
+			calls.check(t)
+		})
+	}
+}
+
+func TestRunRejectsNilComponents(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		component Component
+	}{
+		{"nil interface", nil},
+		{"nil pointer", (*testComponent)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := make(callLog, 2)
+			runner := testRunner(io.Discard)
+			err := runner.Run(t.Context(), calls.component("A", nil, nil), tc.component)
+			const want = "component at index 1 is nil"
+			if err == nil || err.Error() != want {
+				t.Errorf("Run = %v, want %q", err, want)
 			}
 			calls.check(t)
 		})
@@ -776,11 +822,37 @@ func assertComponentError(t *testing.T, err error, name string, cause error) {
 	}
 }
 
-func assertPanicStack(t *testing.T, log, function string) {
+func assertLogRecord(t *testing.T, log *bytes.Buffer, want map[string]string) map[string]any {
 	t.Helper()
-	_, stack, _ := strings.Cut(log, " stack=")
-	stack, _, _ = strings.Cut(stack, "\n")
+	decoder := json.NewDecoder(bytes.NewReader(log.Bytes()))
+	for {
+		var record map[string]any
+		err := decoder.Decode(&record)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode log record: %v", err)
+		}
+		matches := true
+		for key, value := range want {
+			if record[key] != value {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return record
+		}
+	}
+	t.Fatalf("no log record has fields %v in %s", want, log)
+	return nil
+}
+
+func assertPanicStack(t *testing.T, record map[string]any, function string) {
+	t.Helper()
+	stack, _ := record["stack"].(string)
 	if !strings.Contains(stack, function) {
-		t.Errorf("panic stack missing %s in %s", function, log)
+		t.Errorf("panic stack missing %s in log record %v", function, record)
 	}
 }

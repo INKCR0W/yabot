@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
@@ -12,8 +13,10 @@ import (
 
 type Component interface {
 	Name() string
-	// Start receives a child of Run's context that is canceled on the first Fatal.
-	// It should return promptly on cancellation.
+	// Shutdown cancels all Start contexts before reverse-order Stop, so work that
+	// must run until its own Stop needs a separate lifetime.
+	// Return promptly on cancellation and clean up partial startup on error or
+	// panic, since Runner calls Stop only if Start returns nil.
 	Start(ctx context.Context) error
 	// Stop gets a fresh deadline and may outlive Run if it ignores cancellation.
 	Stop(ctx context.Context) error
@@ -90,6 +93,11 @@ func (r *Runner) Run(ctx context.Context, comps ...Component) error {
 		<-watchDone
 	}()
 	started, runErr := r.startAndWait(startCtx, comps)
+	var shutdownCause error
+	if report := r.fatal.Load(); report != nil {
+		shutdownCause = report.err
+	}
+	cancelStart(shutdownCause)
 	r.stop(ctx, started)
 	if report := r.fatal.Swap(&fatalReport{}); report != nil {
 		cause := report.err
@@ -149,7 +157,10 @@ type namedComponent struct {
 func nameComponents(comps []Component) ([]namedComponent, error) {
 	names := make(map[string]struct{}, len(comps))
 	components := make([]namedComponent, 0, len(comps))
-	for _, component := range comps {
+	for i, component := range comps {
+		if isNilComponent(component) {
+			return nil, fmt.Errorf("component at index %d is nil", i)
+		}
 		name := component.Name()
 		if _, exists := names[name]; exists {
 			return nil, fmt.Errorf("duplicate component name %q", name)
@@ -158,6 +169,18 @@ func nameComponents(comps []Component) ([]namedComponent, error) {
 		components = append(components, namedComponent{Component: component, name: name})
 	}
 	return components, nil
+}
+
+func isNilComponent(component Component) bool {
+	value := reflect.ValueOf(component)
+	switch value.Kind() {
+	case reflect.Invalid:
+		return true
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func (r *Runner) stop(ctx context.Context, started []namedComponent) {
