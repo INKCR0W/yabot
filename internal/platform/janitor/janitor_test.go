@@ -3,6 +3,7 @@ package janitor_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,6 +65,159 @@ func TestJanitorFirstRunAndPeriod(t *testing.T) {
 					if got := <-runs; got != stamp {
 						t.Errorf("run %d time = %v, want %v", i+1, got, stamp)
 					}
+				}
+			})
+		})
+	}
+}
+
+func TestJanitorContinuesBacklogOnOriginalCadence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const every = 250 * time.Millisecond
+		const delay = 100 * time.Millisecond
+		var logOutput bytes.Buffer
+		set := metrics.NewSet()
+		j := janitor.New(janitor.Deps{Log: slog.New(slog.NewJSONHandler(&logOutput, nil)), Metrics: set})
+		start := time.Now()
+		var cleanupRuns, otherRuns []time.Duration
+		j.Register("cleanup", every, func(context.Context) (int, error) {
+			cleanupRuns = append(cleanupRuns, time.Since(start))
+			if len(cleanupRuns) <= 3 {
+				return 3, errors.Join(janitor.ErrBacklog, fmt.Errorf("cleanup: %w", janitor.ErrBacklog))
+			}
+			return 1, nil
+		})
+		j.Register("other", every, func(context.Context) (int, error) {
+			otherRuns = append(otherRuns, time.Since(start))
+			return janitor.SweepRows, nil
+		})
+		startJanitor(t, j, t.Context())
+
+		time.Sleep(3 * every)
+		synctest.Wait()
+		if err := j.Stop(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		wantCleanup := []time.Duration{every, every + delay, every + 2*delay, every + 3*delay, 3 * every}
+		if !slices.Equal(cleanupRuns, wantCleanup) {
+			t.Errorf("cleanup runs at %v, want %v", cleanupRuns, wantCleanup)
+		}
+		wantOther := []time.Duration{every, 2 * every, 3 * every}
+		if !slices.Equal(otherRuns, wantOther) {
+			t.Errorf("other task runs at %v, want %v", otherRuns, wantOther)
+		}
+		if logOutput.Len() != 0 {
+			t.Errorf("unexpected logs at Info level or above: %s", &logOutput)
+		}
+		var metricsOutput strings.Builder
+		set.WritePrometheus(&metricsOutput)
+		lines := strings.Split(metricsOutput.String(), "\n")
+		for _, want := range []string{
+			`yabot_janitor_runs_total{task="cleanup"} 5`,
+			`yabot_janitor_errors_total{task="cleanup"} 0`,
+			`yabot_janitor_rows_total{task="cleanup"} 11`,
+		} {
+			if !slices.Contains(lines, want) {
+				t.Errorf("missing metric %q in %q", want, metricsOutput.String())
+			}
+		}
+	})
+}
+
+func TestJanitorMixedBacklogErrorsKeepOriginalCadence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "joined", err: errors.Join(janitor.ErrBacklog, sql.ErrTxDone)},
+		{name: "wrapped join", err: fmt.Errorf("cleanup: %w", errors.Join(sql.ErrTxDone, janitor.ErrBacklog))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const every = 250 * time.Millisecond
+				var output bytes.Buffer
+				set := metrics.NewSet()
+				log := slog.New(slog.NewJSONHandler(&output, nil))
+				j := janitor.New(janitor.Deps{Log: log, Metrics: set})
+				start := time.Now()
+				var runs []time.Duration
+				j.Register("cleanup", every, func(context.Context) (int, error) {
+					runs = append(runs, time.Since(start))
+					if len(runs) == 1 {
+						return 3, tc.err
+					}
+					return 0, nil
+				})
+				startJanitor(t, j, t.Context())
+				time.Sleep(2 * every)
+				synctest.Wait()
+				if err := j.Stop(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if want := []time.Duration{every, 2 * every}; !slices.Equal(runs, want) {
+					t.Errorf("cleanup runs at %v, want %v", runs, want)
+				}
+
+				var entry struct {
+					Level string `json:"level"`
+					Error string `json:"error"`
+				}
+				if err := json.NewDecoder(&output).Decode(&entry); err != nil {
+					t.Errorf("decode cleanup error log: %v", err)
+				} else if entry.Level != "ERROR" || entry.Error != tc.err.Error() {
+					t.Errorf("log = (%q, %q), want (ERROR, %q)", entry.Level, entry.Error, tc.err)
+				}
+				var metricsOutput strings.Builder
+				set.WritePrometheus(&metricsOutput)
+				const wantErrorMetric = `yabot_janitor_errors_total{task="cleanup"} 1`
+				if !slices.Contains(strings.Split(metricsOutput.String(), "\n"), wantErrorMetric) {
+					t.Errorf("missing metric %q in %q", wantErrorMetric, metricsOutput.String())
+				}
+			})
+		})
+	}
+}
+
+func TestJanitorStopDuringBacklog(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		afterFirstRun time.Duration
+		wantRuns      int
+	}{
+		{name: "waiting for continuation", wantRuns: 1},
+		{name: "continuation running", afterFirstRun: janitor.ContinueDelay, wantRuns: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const every = time.Second
+				j := janitor.New(janitor.Deps{Metrics: metrics.NewSet()})
+				runs := 0
+				j.Register("cleanup", every, func(ctx context.Context) (int, error) {
+					runs++
+					if runs == 2 {
+						<-ctx.Done()
+					}
+					return 0, janitor.ErrBacklog
+				})
+				startJanitor(t, j, t.Context())
+
+				time.Sleep(every + tc.afterFirstRun)
+				synctest.Wait()
+				if runs != tc.wantRuns {
+					t.Fatalf("runs before Stop = %d, want %d", runs, tc.wantRuns)
+				}
+				started := time.Now()
+				ctx, cancel := context.WithTimeout(t.Context(), janitor.ContinueDelay/2)
+				defer cancel()
+				if err := j.Stop(ctx); err != nil {
+					t.Fatalf("Stop: %v", err)
+				}
+				if elapsed := time.Since(started); elapsed != 0 {
+					t.Errorf("Stop advanced the clock by %v, want 0", elapsed)
+				}
+				time.Sleep(every)
+				if runs != tc.wantRuns {
+					t.Errorf("runs after Stop = %d, want %d", runs, tc.wantRuns)
 				}
 			})
 		})

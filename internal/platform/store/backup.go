@@ -20,7 +20,13 @@ const (
 )
 
 type backupFiles struct {
-	snapshots []string
+	daily        []backupSnapshot
+	preMigration []backupSnapshot
+}
+
+type backupSnapshot struct {
+	name  string
+	stamp time.Time
 }
 
 // BackupDir returns the absolute path to the store's default backup directory.
@@ -59,9 +65,8 @@ func LatestBackup(dir string) (time.Time, bool, error) {
 	return time.Time{}, false, nil
 }
 
-// Backup retains the new daily snapshot and up to keep-1 of the newest daily snapshots.
-// The parent of dir must exist, keep must be positive, and calls on the same store are serialized.
-// A snapshot can contain an unfinished upgrade marker. Schedule daily backups after migration succeeds.
+// Backup retains up to keep daily snapshots including the new one and expires unmarked migration snapshots older than keep 24-hour days.
+// Calls are serialized, require a positive keep and an existing parent of dir, and should run after migration succeeds to avoid copying an unfinished upgrade marker.
 func (s *Store) Backup(ctx context.Context, dir string, keep int) error {
 	if keep < 1 {
 		return fmt.Errorf("store backup retention must be positive: %d", keep)
@@ -78,7 +83,7 @@ func (s *Store) Backup(ctx context.Context, dir string, keep int) error {
 	if err != nil {
 		return fmt.Errorf("resolve store backup directory: %w", err)
 	}
-	files, err := prepareBackup(dir, false)
+	files, err := prepareBackup(dir)
 	if err != nil {
 		return err
 	}
@@ -86,9 +91,53 @@ func (s *Store) Backup(ctx context.Context, dir string, keep int) error {
 	if err != nil {
 		return err
 	}
-	deleted, err := files.prune(dir, filepath.Base(path), keep)
-	s.log.Info("store backup published", "path", path, "size_bytes", size, "duration", time.Since(start), "deleted", deleted)
-	return err
+	deleted, pruneErr := pruneBackups(files.daily, dir, filepath.Base(path), keep)
+	expired, expireErr := s.pruneExpiredMigrationBackups(ctx, files.preMigration, dir, keep)
+	s.log.Info("store backup published", "path", path, "size_bytes", size, "duration", time.Since(start), "deleted", deleted+expired)
+	return errors.Join(pruneErr, expireErr)
+}
+
+func (s *Store) pruneExpiredMigrationBackups(ctx context.Context, files []backupSnapshot, dir string, keep int) (int, error) {
+	// Backup filenames have four-digit years. A longer retention cannot expire a snapshot.
+	if len(files) == 0 || keep >= 10_000*366 {
+		return 0, nil
+	}
+	cutoff := s.now().UTC().AddDate(0, 0, -keep)
+	if !files[0].stamp.Before(cutoff) {
+		return 0, nil
+	}
+	var hasTable bool
+	if err := s.checkpoint.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM main.sqlite_schema WHERE type IN ('table', 'view') AND name = 'store_upgrade' COLLATE NOCASE
+	)`).Scan(&hasTable); err != nil {
+		return 0, fmt.Errorf("check store upgrade marker table: %w", err)
+	}
+	var retainedName string
+	if hasTable {
+		marker, err := readUpgradeMarker(ctx, s.checkpoint)
+		if err != nil {
+			return 0, err
+		}
+		if marker != nil {
+			retainedName = marker.backup
+		}
+	}
+	deleted := 0
+	var errs []error
+	for _, file := range files {
+		if !file.stamp.Before(cutoff) {
+			break
+		}
+		if file.name == retainedName {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, file.name)); err != nil {
+			errs = append(errs, fmt.Errorf("remove expired store migration backup: %w", err))
+			continue
+		}
+		deleted++
+	}
+	return deleted, errors.Join(errs...)
 }
 
 func (s *Store) createBackup(ctx context.Context, dir, target string) (string, int64, error) {
@@ -248,7 +297,7 @@ func (s *Store) syncBackupDirectory(path string) error {
 	return errors.Join(dir.Sync(), dir.Close())
 }
 
-func prepareBackup(dir string, preMigration bool) (backupFiles, error) {
+func prepareBackup(dir string) (backupFiles, error) {
 	if err := prepareBackupDirectory(dir); err != nil {
 		return backupFiles{}, err
 	}
@@ -266,7 +315,7 @@ func prepareBackup(dir string, preMigration bool) (backupFiles, error) {
 		if !isTemp {
 			name, isTemp = strings.CutSuffix(name, ".tmp")
 		}
-		_, target, ok := parseBackupName(name)
+		stamp, target, ok := parseBackupName(name)
 		if !ok {
 			continue
 		}
@@ -274,8 +323,10 @@ func prepareBackup(dir string, preMigration bool) (backupFiles, error) {
 			if err := removeBackupTemp(filepath.Join(dir, entry.Name())); err != nil {
 				errs = append(errs, err)
 			}
-		} else if (target != "") == preMigration {
-			files.snapshots = append(files.snapshots, name)
+		} else if target != "" {
+			files.preMigration = append(files.preMigration, backupSnapshot{name: name, stamp: stamp})
+		} else {
+			files.daily = append(files.daily, backupSnapshot{name: name, stamp: stamp})
 		}
 	}
 	return files, errors.Join(errs...)
@@ -305,20 +356,20 @@ func parseBackupName(name string) (stamp time.Time, target string, ok bool) {
 	return stamp, target, err == nil && stamp.Format(backupStampLayout) == timestamp
 }
 
-func (files backupFiles) prune(dir, retainedName string, keep int) (int, error) {
+func pruneBackups(files []backupSnapshot, dir, retainedName string, keep int) (int, error) {
 	var errs []error
 	deleted := 0
 	remaining := keep - 1
 	// ReadDir name order preserves the chronological order within each backup type.
-	for _, name := range slices.Backward(files.snapshots) {
-		if name == retainedName {
+	for _, file := range slices.Backward(files) {
+		if file.name == retainedName {
 			continue
 		}
 		if remaining > 0 {
 			remaining--
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+		if err := os.Remove(filepath.Join(dir, file.name)); err != nil {
 			errs = append(errs, fmt.Errorf("remove old store backup: %w", err))
 			continue
 		}

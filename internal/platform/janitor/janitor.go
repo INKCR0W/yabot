@@ -13,7 +13,13 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
-const FirstRunDelay = time.Minute
+const (
+	FirstRunDelay = time.Minute
+	ContinueDelay = 100 * time.Millisecond
+)
+
+// ErrBacklog signals that a successful task stopped with work potentially remaining.
+var ErrBacklog = errors.New("janitor: backlog may remain")
 
 type Deps struct {
 	Log     *slog.Logger
@@ -56,6 +62,8 @@ func (j *Janitor) Name() string { return "janitor" }
 
 // Register panics after Start succeeds, or if name is empty or already registered,
 // every is nonpositive, or fn is nil.
+// An error with only ErrBacklog as its cause counts as success and schedules another run after ContinueDelay.
+// The original cadence resumes at its next future tick once a run stops reporting backlog.
 func (j *Janitor) Register(name string, every time.Duration, fn func(context.Context) (int, error)) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -158,7 +166,10 @@ func (j *Janitor) schedule(ctx context.Context, task *task, started time.Time) {
 		if ctx.Err() != nil {
 			return
 		}
-		j.run(ctx, task)
+		if j.run(ctx, task) {
+			timer.Reset(ContinueDelay)
+			continue
+		}
 
 		// Keep the original cadence while skipping periods that elapsed during the run.
 		next = next.Add(task.every)
@@ -169,7 +180,7 @@ func (j *Janitor) schedule(ctx context.Context, task *task, started time.Time) {
 	}
 }
 
-func (j *Janitor) run(ctx context.Context, task *task) {
+func (j *Janitor) run(ctx context.Context, task *task) bool {
 	started := j.deps.Now()
 	task.runs.Inc()
 	defer func() {
@@ -189,11 +200,12 @@ func (j *Janitor) run(ctx context.Context, task *task) {
 	if n > 0 {
 		task.rows.Add(n)
 	}
-	if err == nil {
+	hasBacklog := hasOnlyCause(err, ErrBacklog)
+	if err == nil || hasBacklog {
 		if n > 0 {
 			j.deps.Log.Debug("janitor task processed rows", "task", task.name, "rows", n)
 		}
-		return
+		return hasBacklog
 	}
 
 	task.errors.Inc()
@@ -203,6 +215,7 @@ func (j *Janitor) run(ctx context.Context, task *task) {
 	case !hasOnlyCause(err, ctx.Err()):
 		j.deps.Log.Error("janitor task failed", "task", task.name, "error", err)
 	}
+	return false
 }
 
 func hasOnlyCause(err, target error) bool {

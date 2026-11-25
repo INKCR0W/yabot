@@ -209,8 +209,8 @@ func TestBackupRetention(t *testing.T) {
 		{"yabot-20261122T153000.123Z.db", false},
 		{"yabot-20261123T153000.123Z.db", false},
 		{"yabot-20261124T153000.123Z.db", true},
-		{"yabot-premigrate-20261121T153000.123Z-0123456789ab.db", true},
-		{"yabot-premigrate-20261122T153000.123Z-123456789abc.db", true},
+		{"yabot-premigrate-20261121T153000.123Z-0123456789ab.db", false},
+		{"yabot-premigrate-20261124T153000.123Z-123456789abc.db", true},
 		{"yabot-20261122T153001.123Z.db.tmp", false},
 		{"yabot-20260230T153000.123Z.db", true},
 		{"yabot-20260230T153000.123Z.db.tmp", true},
@@ -245,6 +245,172 @@ func TestBackupRetention(t *testing.T) {
 				t.Errorf("backup fixture %q = %q, %v, want original contents", fixture.name, contents, err)
 			}
 		}
+	}
+}
+
+func TestBackupExpiresUnmarkedMigrationSnapshots(t *testing.T) {
+	const (
+		keep     = 7
+		marked   = "yabot-premigrate-20261116T153000.123Z-0123456789ab.db"
+		expired  = "yabot-premigrate-20261118T153000.122Z-0123456789ab.db"
+		atCutoff = "yabot-premigrate-20261118T153000.123Z-0123456789ab.db"
+		recent   = "yabot-premigrate-20261118T153000.124Z-0123456789ab.db"
+	)
+	for _, tc := range []struct {
+		name           string
+		denyMarkerRead bool
+	}{
+		{name: "protect active marker and cutoff"},
+		{name: "skip migration cleanup when marker read fails", denyMarkerRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := newTestDeps(t)
+			stamp := backupTestTime().Truncate(time.Millisecond)
+			deps.Now = func() time.Time { return stamp }
+			s := openTestStore(t, t.Context(), deps)
+			ctx := t.Context()
+			if _, err := s.write.ExecContext(ctx, createUpgradeTable); err != nil {
+				t.Fatalf("create upgrade marker table: %v", err)
+			}
+			if _, err := s.write.ExecContext(ctx, `INSERT INTO store_upgrade (id, target, backup, started_at) VALUES (1, ?, ?, ?)`,
+				"0123456789ab", marked, stamp.UnixMilli()); err != nil {
+				t.Fatalf("record protected backup: %v", err)
+			}
+
+			dir := s.BackupDir()
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatalf("create backup directory fixture: %v", err)
+			}
+			fixtures := []string{marked, expired, atCutoff, recent}
+			want := []string{backupTestName, marked, atCutoff, recent}
+			for day := 1; day <= keep; day++ {
+				name := "yabot-" + stamp.UTC().AddDate(0, 0, -day).Format(backupStampLayout) + ".db"
+				fixtures = append(fixtures, name)
+				if day < keep {
+					want = append(want, name)
+				}
+			}
+			for _, name := range fixtures {
+				if err := os.WriteFile(filepath.Join(dir, name), nil, 0600); err != nil {
+					t.Fatalf("write backup fixture %q: %v", name, err)
+				}
+			}
+			if err := os.Chtimes(filepath.Join(dir, expired), stamp, stamp); err != nil {
+				t.Fatalf("set misleading modification time on expired migration backup: %v", err)
+			}
+			if tc.denyMarkerRead {
+				want = append(want, expired)
+				s.hooks = &storeHooks{syncBackupDirectory: func(path string) error {
+					if path == dir {
+						setStoreTestAuthorizer(t, s.checkpoint, func(action sqlite.AuthorizerActionCode, table, _, _, _ string) sqlite.AuthorizerReturnCode {
+							if action == sqlite.AuthRead && table == "store_upgrade" {
+								return sqlite.AuthorizerDeny
+							}
+							return sqlite.AuthorizerOK
+						})
+					}
+					return nil
+				}}
+			}
+			err := s.Backup(ctx, dir, keep)
+			if tc.denyMarkerRead {
+				if err == nil || !strings.Contains(err.Error(), "read store upgrade marker") {
+					t.Errorf("Backup returned %v, want a marker read error", err)
+				}
+			} else if err != nil {
+				t.Errorf("Backup: %v", err)
+			}
+			slices.Sort(want)
+			if got := backupTestEntries(t, dir); !slices.Equal(got, want) {
+				t.Errorf("backup directory entries = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestBackupExpiresMigrationSnapshotAfterSuccessfulMigration(t *testing.T) {
+	const expired = "yabot-premigrate-20261117T153000.123Z-0123456789ab.db"
+	deps := newTestDeps(t)
+	deps.Now = backupTestTime
+	ctx := t.Context()
+	s := openTestStore(t, ctx, deps)
+	migrations := []Migration{{Component: "items", Version: 1, SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY); INSERT INTO items VALUES (1)"}}
+	if err := s.Migrate(ctx, migrations); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+	assertUpgradeBackup(t, s.Read(), "")
+
+	dir := s.BackupDir()
+	recent := findMigrationSnapshot(t, dir, backupTestTime())
+	if err := os.WriteFile(filepath.Join(dir, expired), nil, 0600); err != nil {
+		t.Fatalf("write expired migration backup: %v", err)
+	}
+	if err := s.Backup(ctx, dir, 7); err != nil {
+		t.Fatalf("back up migrated store: %v", err)
+	}
+	if got, want := backupTestEntries(t, dir), []string{backupTestName, recent}; !slices.Equal(got, want) {
+		t.Fatalf("backup directory entries = %v, want %v", got, want)
+	}
+	assertBackupIDs(t, filepath.Join(dir, backupTestName), 1)
+}
+
+func TestBackupExpiresLastMigrationSnapshot(t *testing.T) {
+	const keep = 7
+	deps := newTestDeps(t)
+	stamp := backupTestTime()
+	deps.Now = func() time.Time { return stamp }
+	s := openTestStore(t, t.Context(), deps)
+	dir := s.BackupDir()
+
+	initial, _ := migrationUpgradeSteps()
+	mustMigrate(t, s, initial)
+	assertUpgradeBackup(t, s.Read(), "")
+	assertMigrationBackupNames(t, dir, findMigrationSnapshot(t, dir, stamp))
+
+	stamp = stamp.Add(keep*24*time.Hour + time.Minute)
+	if err := s.Backup(t.Context(), dir, keep); err != nil {
+		t.Fatalf("back up migrated store: %v", err)
+	}
+	assertMigrationBackupNames(t, dir, "yabot-"+stamp.UTC().Format(backupStampLayout)+".db")
+}
+
+func TestBackupMigrationRetentionUsesAbsoluteDaysAcrossDST(t *testing.T) {
+	location, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("Europe/Berlin time zone data unavailable: %v", err)
+	}
+	const keep = 7
+	for _, tc := range []struct {
+		name  string
+		stamp time.Time
+	}{
+		{"spring", time.Date(2026, time.March, 29, 12, 0, 0, 0, location)},
+		{"fall", time.Date(2026, time.October, 25, 12, 0, 0, 0, location)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := newTestDeps(t)
+			deps.Now = func() time.Time { return tc.stamp }
+			s := openTestStore(t, t.Context(), deps)
+			dir := s.BackupDir()
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatalf("create backup directory fixture: %v", err)
+			}
+			cutoff := tc.stamp.Add(-keep * 24 * time.Hour)
+			snapshotName := func(stamp time.Time) string {
+				return "yabot-premigrate-" + stamp.UTC().Format(backupStampLayout) + "-0123456789ab.db"
+			}
+			expired := snapshotName(cutoff.Add(-30 * time.Minute))
+			recent := snapshotName(cutoff.Add(30 * time.Minute))
+			for _, name := range []string{expired, recent} {
+				if err := os.WriteFile(filepath.Join(dir, name), nil, 0600); err != nil {
+					t.Fatalf("write migration snapshot fixture %q: %v", name, err)
+				}
+			}
+			if err := s.Backup(t.Context(), dir, keep); err != nil {
+				t.Fatalf("back up store near DST transition: %v", err)
+			}
+			assertMigrationBackupNames(t, dir, "yabot-"+tc.stamp.UTC().Format(backupStampLayout)+".db", recent)
+		})
 	}
 }
 

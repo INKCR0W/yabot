@@ -73,7 +73,7 @@ func (s *Store) Migrate(ctx context.Context, sets ...[]Migration) error {
 		if _, err := s.write.ExecContext(ctx, createUpgradeTable); err != nil {
 			return fmt.Errorf("create store upgrade table: %w", err)
 		}
-		marker, err = s.readUpgradeMarker(ctx)
+		marker, err = readUpgradeMarker(ctx, s.write)
 		if err != nil {
 			return err
 		}
@@ -100,9 +100,9 @@ func (s *Store) Migrate(ctx context.Context, sets ...[]Migration) error {
 	return nil
 }
 
-func (s *Store) readUpgradeMarker(ctx context.Context) (*upgradeMarker, error) {
+func readUpgradeMarker(ctx context.Context, db *sql.DB) (*upgradeMarker, error) {
 	var marker upgradeMarker
-	err := s.write.QueryRowContext(ctx, `SELECT target, backup FROM main.store_upgrade WHERE id = 1`).Scan(&marker.target, &marker.backup)
+	err := db.QueryRowContext(ctx, `SELECT target, backup FROM main.store_upgrade WHERE id = 1`).Scan(&marker.target, &marker.backup)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -125,7 +125,7 @@ func (s *Store) prepareUpgrade(ctx context.Context, target string, marker *upgra
 	}
 	start := time.Now()
 	dir := s.BackupDir()
-	files, err := prepareBackup(dir, true)
+	files, err := prepareBackup(dir)
 	if err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ func (s *Store) prepareUpgrade(ctx context.Context, target string, marker *upgra
 	}
 	if path != "" {
 		s.log.Info("reusing store backup before migration", "path", path, "target", target)
-		_, err := files.prune(dir, marker.backup, s.backupKeep)
+		_, err := pruneBackups(files.preMigration, dir, marker.backup, s.backupKeep)
 		return err
 	}
 	// Commit the deletion before VACUUM INTO can copy a stale marker into the snapshot.
@@ -154,7 +154,7 @@ func (s *Store) prepareUpgrade(ctx context.Context, target string, marker *upgra
 		target, name, time.Now().UnixMilli()); err != nil {
 		return fmt.Errorf("record store upgrade marker: %w", err)
 	}
-	deleted, err := files.prune(dir, name, s.backupKeep)
+	deleted, err := pruneBackups(files.preMigration, dir, name, s.backupKeep)
 	s.log.Info("store backup published", "path", path, "size_bytes", size, "duration", time.Since(start), "deleted", deleted)
 	return err
 }

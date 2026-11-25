@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"modernc.org/sqlite"
@@ -64,6 +65,41 @@ func TestCheckpointReclaimsIdleWAL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCheckpointRechecksWritesAfterBorrowingConnection(t *testing.T) {
+	deps := newTestDeps(t)
+	synctest.Test(t, func(t *testing.T) {
+		s := openBatchTestStore(t, deps)
+		ticks := startCheckpointTest(t, s, nil)
+		writeCheckpointItem(t, s, 1)
+		ticks.run(t, checkpointPassive)
+
+		held, err := s.checkpoint.Conn(t.Context())
+		if err != nil {
+			t.Fatalf("borrow checkpoint connection: %v", err)
+		}
+		release := sync.OnceFunc(func() {
+			if err := held.Close(); err != nil {
+				t.Errorf("return checkpoint connection: %v", err)
+			}
+		})
+		defer release()
+		waitsBeforeTick := s.checkpoint.Stats().WaitCount
+		ticks.send(t)
+		synctest.Wait()
+		if got := s.checkpoint.Stats().WaitCount - waitsBeforeTick; got != 1 {
+			t.Fatalf("checkpoint connection waits while held = %d, want 1", got)
+		}
+
+		writeCheckpointItem(t, s, 2)
+		release()
+		got := awaitLifecycleResult(t, ticks.results)
+		if got.mode != checkpointPassive || got.err != nil || got.result.logPages <= 0 {
+			t.Fatalf("checkpoint after a write while waiting = %+v, want successful PASSIVE with WAL pages", got)
+		}
+		ticks.run(t, checkpointTruncate)
+	})
 }
 
 func TestCheckpointReclaimsWALAfterFailedCommit(t *testing.T) {
@@ -283,11 +319,18 @@ func TestObserveWALGrowth(t *testing.T) {
 		return slices.Concat(beforeAlert, tail)
 	}
 	alert := observation{pages: firstAlertPages, wantGrowing: true}
-	flat := observation{pages: firstAlertPages - 1}
-	alternating := []observation{{pages: firstPages}}
-	for i := 1; i <= 2*walGrowthThreshold; i++ {
-		sample := observation{pages: firstPages + i}
-		alternating = append(alternating, sample, sample)
+	flat := make([]observation, walGrowthThreshold+2)
+	for i := range flat {
+		flat[i] = observation{pages: firstPages}
+	}
+	staircase := []observation{{pages: firstPages}}
+	for i := 1; i <= walGrowthThreshold; i++ {
+		step := observation{pages: firstPages + i, wantGrowing: i == walGrowthThreshold}
+		staircase = append(staircase, step, step)
+	}
+	afterDecrease := make([]observation, walGrowthThreshold+1)
+	for i := range afterDecrease {
+		afterDecrease[i] = observation{pages: firstPages - 1 + i, wantGrowing: i == walGrowthThreshold}
 	}
 	checkpointErr := errors.New("checkpoint failed")
 
@@ -297,10 +340,12 @@ func TestObserveWALGrowth(t *testing.T) {
 	}{
 		{"first observation establishes baseline", beforeAlert[:1]},
 		{"reaches threshold", withPrefix(alert)},
-		{"flat before threshold resets count", withPrefix(flat, observation{pages: firstAlertPages})},
-		{"alternating increases and plateaus", alternating},
-		{"flat ends alert", withPrefix(alert, observation{pages: firstAlertPages}, observation{pages: firstAlertPages + 1})},
-		{"decrease ends alert", withPrefix(alert, observation{pages: firstPages}, observation{pages: firstPages + 1})},
+		{"flat before threshold preserves count", withPrefix(observation{pages: firstAlertPages - 1}, alert)},
+		{"flat without growth stays quiet", flat},
+		{"single increase after long plateau stays quiet", slices.Concat(flat, []observation{{pages: firstPages + 1}})},
+		{"staircase growth reaches threshold", staircase},
+		{"flat keeps alert active", withPrefix(alert, alert)},
+		{"decrease ends alert and restarts streak", slices.Concat(withPrefix(alert), afterDecrease)},
 		{"continued growth keeps alert active", withPrefix(alert,
 			observation{pages: firstAlertPages + 1, wantGrowing: true},
 			observation{pages: firstAlertPages + 2, wantGrowing: true})},
@@ -333,6 +378,28 @@ func TestCheckpointReportsSustainedWALGrowth(t *testing.T) {
 			testCheckpointWALGrowth(t, test.keepSnapshot)
 		})
 	}
+}
+
+func TestCheckpointDoesNotReportWALGrowthAfterNoOpWritesAndTruncate(t *testing.T) {
+	deps := newTestDeps(t)
+	s := openBatchTestStore(t, deps)
+	ticks := startCheckpointTest(t, s, nil)
+	ticks.run(t, checkpointTruncate)
+
+	for range walGrowthThreshold + 1 {
+		if err := s.WriteWait(t.Context(), func(*sql.Tx) error { return nil }); err != nil {
+			t.Fatalf("write without WAL frames: %v", err)
+		}
+		if result := ticks.run(t, checkpointPassive); result.logPages != 0 {
+			t.Fatalf("PASSIVE without WAL frames = %+v, want zero pages", result)
+		}
+	}
+	ticks.run(t, checkpointTruncate)
+	writeCheckpointItem(t, s, 1)
+	if result := ticks.run(t, checkpointPassive); result.logPages <= 0 {
+		t.Fatalf("PASSIVE after write = %+v, want a nonempty WAL", result)
+	}
+	assertBatchMetric(t, deps.Metrics, "yabot_store_wal_growing", 0)
 }
 
 func TestCheckpointClearsStaleGrowthGaugeOnReopen(t *testing.T) {
@@ -393,12 +460,13 @@ func testCheckpointWALGrowth(t *testing.T, keepSnapshot bool) {
 	if result.busy != wantBusy || result.logPages != wantPages {
 		t.Fatalf("recovery TRUNCATE = %+v, want busy=%d and logPages=%d", result, wantBusy, wantPages)
 	}
-	assertBatchMetric(t, deps.Metrics, "yabot_store_wal_growing", 0)
 	if keepSnapshot {
+		assertBatchMetric(t, deps.Metrics, "yabot_store_wal_growing", 1)
 		assertCheckpointSnapshot(t, reader)
 		release()
 		ticks.run(t, checkpointTruncate)
 	}
+	assertBatchMetric(t, deps.Metrics, "yabot_store_wal_growing", 0)
 	ticks.run(t, "")
 	if err := s.Stop(t.Context()); err != nil {
 		t.Fatalf("stop store: %v", err)
@@ -410,8 +478,8 @@ func testCheckpointWALGrowth(t *testing.T, keepSnapshot bool) {
 	if got := records[0].WALPages; got == nil || *got != warningPages {
 		t.Errorf("expected WAL growth warning with wal_pages=%d, got %+v", warningPages, records[0])
 	}
-	if got := records[1].WALPages; got == nil || *got != wantPages {
-		t.Errorf("expected WAL recovery info with wal_pages=%d, got %+v", wantPages, records[1])
+	if got := records[1].WALPages; got == nil || *got != 0 {
+		t.Errorf("expected WAL recovery info with wal_pages=0, got %+v", records[1])
 	}
 }
 
@@ -448,8 +516,8 @@ func TestCheckpointReportsStatementErrorsAndRetriesIdle(t *testing.T) {
 		}
 		assertBatchMetric(t, deps.Metrics, "yabot_store_checkpoint_errors_total", i)
 		records := readCheckpointLogs(t, &logs)
-		if len(records) != 1 || records[0].Level != "WARN" || !strings.Contains(records[0].Error, "database table is locked") {
-			t.Errorf("expected one checkpoint warning carrying SQLITE_LOCKED, got %+v", records)
+		if len(records) != 1 || records[0].Level != "ERROR" || !strings.Contains(records[0].Error, "database table is locked") {
+			t.Errorf("expected one checkpoint error log carrying SQLITE_LOCKED, got %+v", records)
 		}
 		if err := deps.Health.(*testHealthRegistry).check(); err != nil {
 			t.Errorf("store health after checkpoint failure = %v", err)

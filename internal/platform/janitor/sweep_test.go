@@ -23,19 +23,21 @@ func TestSweep(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		initial     int
-		batchRows   int
 		delay       time.Duration
 		failBatch   int
 		want        int
 		wantErr     error
 		wantBatches int
 	}{
-		{name: "row limit", initial: 450, want: 200},
-		{name: "remaining row limit", initial: 450, batchRows: 60, want: 200},
-		{name: "exhausted", initial: 30, want: 30},
-		{name: "time budget exceeded", initial: 450, batchRows: 10, delay: 3 * time.Millisecond, want: 20, wantBatches: 2},
-		{name: "time budget reached", initial: 450, batchRows: 10, delay: 5 * time.Millisecond, want: 10, wantBatches: 1},
-		{name: "rollback failed batch", initial: 450, batchRows: 10, failBatch: 2, want: 10, wantErr: delErr},
+		{name: "row limit with rows left", initial: 450, want: 200, wantErr: janitor.ErrBacklog},
+		{name: "exact row limit", initial: 200, want: 200, wantErr: janitor.ErrBacklog},
+		{name: "empty", wantBatches: 1},
+		{name: "short batch", initial: 30, want: 30, wantBatches: 1},
+		{name: "short second batch", initial: 130, want: 130, wantBatches: 2},
+		{name: "time budget exceeded", initial: 450, delay: 6 * time.Millisecond, want: 100, wantErr: janitor.ErrBacklog, wantBatches: 1},
+		{name: "time budget reached", initial: 450, delay: 5 * time.Millisecond, want: 100, wantErr: janitor.ErrBacklog, wantBatches: 1},
+		{name: "short batch at time budget", initial: 30, delay: 5 * time.Millisecond, want: 30, wantBatches: 1},
+		{name: "rollback failed batch", initial: 450, failBatch: 2, want: 100, wantErr: delErr, wantBatches: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := sweepDataDir(t)
@@ -48,9 +50,6 @@ func TestSweep(t *testing.T) {
 					calls++
 					if tc.delay > 0 {
 						time.Sleep(tc.delay)
-					}
-					if tc.batchRows > 0 {
-						limit = min(limit, tc.batchRows)
 					}
 					deleted, err := deleteSweepRows(tx, limit)
 					if err != nil {
@@ -141,6 +140,9 @@ func openSweepStore(t *testing.T, dir string, rows int) *store.Store {
 	if err := s.WriteWait(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec("CREATE TABLE items (id INTEGER PRIMARY KEY)"); err != nil {
 			return err
+		}
+		if rows == 0 {
+			return nil
 		}
 		_, err := tx.Exec(`WITH RECURSIVE ids(id) AS (VALUES (1) UNION ALL SELECT id + 1 FROM ids WHERE id < ?)
 			INSERT INTO items SELECT id FROM ids`, rows)

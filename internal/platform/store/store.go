@@ -29,8 +29,8 @@ type Deps struct {
 	Log                *slog.Logger
 	WriteQueue         int              // Valid range: 1 to 1<<20.
 	CheckpointInterval time.Duration    // Must be positive. The configuration default is 500 ms.
-	BackupKeep         int              // Pre-migration snapshots to keep; daily retention is Backup's keep. Must be positive.
-	Now                func() time.Time // Supplies backup timestamps. Defaults to time.Now.
+	BackupKeep         int              // Snapshot count limit during migration. Must be positive.
+	Now                func() time.Time // Supplies backup timestamps and the retention clock. Defaults to time.Now.
 	Metrics            *metrics.Set
 	Health             HealthRegistry
 	Fatal              func(component string, err error)
