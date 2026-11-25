@@ -238,6 +238,8 @@ func TestOpenValidatesDeps(t *testing.T) {
 		{"queue exceeds limit", func(deps *Deps) { deps.WriteQueue = 1<<20 + 1 }, "queue capacity"},
 		{"zero checkpoint interval", func(deps *Deps) { deps.CheckpointInterval = 0 }, "checkpoint interval"},
 		{"negative checkpoint interval", func(deps *Deps) { deps.CheckpointInterval = -time.Millisecond }, "checkpoint interval"},
+		{"zero backup retention", func(deps *Deps) { deps.BackupKeep = 0 }, "backup retention"},
+		{"negative backup retention", func(deps *Deps) { deps.BackupKeep = -1 }, "backup retention"},
 		{"nil metrics", func(deps *Deps) { deps.Metrics = nil }, "metrics set"},
 		{"nil health", func(deps *Deps) { deps.Health = nil }, "health registry"},
 		{"typed nil health", func(deps *Deps) { deps.Health = (*testHealthRegistry)(nil) }, "health registry"},
@@ -344,6 +346,7 @@ func newTestDeps(t *testing.T) Deps {
 		CacheKiB:           8000,
 		WriteQueue:         4096,
 		CheckpointInterval: 500 * time.Millisecond,
+		BackupKeep:         7,
 		Metrics:            metrics.NewSet(),
 		Health:             &testHealthRegistry{},
 		Fatal: func(name string, err error) {

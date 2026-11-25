@@ -288,15 +288,16 @@ func (s *Store) rollbackConnection(ctx context.Context, conn *sql.Conn) {
 }
 
 func (s *Store) logRollbackError(err error) {
-	if err == nil || errors.Is(err, sql.ErrTxDone) {
-		return
-	}
-	var sqliteErr *sqlite.Error
-	if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_ERROR &&
-		strings.Contains(sqliteErr.Error(), "cannot rollback - no transaction is active") {
+	if err == nil || errors.Is(err, sql.ErrTxDone) || isNoActiveTransactionError(err) {
 		return
 	}
 	s.log.Error("store failed to roll back batch", "error", err)
+}
+
+func isNoActiveTransactionError(err error) bool {
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_ERROR &&
+		strings.Contains(sqliteErr.Error(), "cannot rollback - no transaction is active")
 }
 
 func callOp(tx *sql.Tx, op Op) (err error) {

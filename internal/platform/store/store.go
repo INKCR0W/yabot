@@ -27,8 +27,10 @@ type Deps struct {
 	Dir                string
 	CacheKiB           int // SQLite stores the negated value as a signed 32-bit integer.
 	Log                *slog.Logger
-	WriteQueue         int           // Valid range: 1 to 1<<20.
-	CheckpointInterval time.Duration // Must be positive. The configuration default is 500 ms.
+	WriteQueue         int              // Valid range: 1 to 1<<20.
+	CheckpointInterval time.Duration    // Must be positive. The configuration default is 500 ms.
+	BackupKeep         int              // Pre-migration snapshots to keep; daily retention is Backup's keep. Must be positive.
+	Now                func() time.Time // Supplies backup timestamps. Defaults to time.Now.
 	Metrics            *metrics.Set
 	Health             HealthRegistry
 	Fatal              func(component string, err error)
@@ -54,8 +56,14 @@ type Store struct {
 	checkpointInterval time.Duration
 	checkpointMetrics  checkpointMetrics
 	startedBatches     atomic.Uint64
+	backupDir          string
+	backupKeep         int
+	now                func() time.Time
+	maintenance        chan struct{}
+	closing            chan struct{}
 
 	mu               sync.Mutex
+	migrating        bool
 	writerDone       chan struct{}
 	checkpointDone   chan struct{}
 	cancelCheckpoint context.CancelFunc
@@ -70,6 +78,7 @@ type storeHooks struct {
 	checkpointTicks     <-chan time.Time
 	beforeCheckpoint    func(context.Context, string) error
 	afterCheckpointTick func(string, checkpointResult, error)
+	syncBackupDirectory func(string) error
 	beforeClosePool     func(name string) error
 	afterClosePool      func(name string)
 }
@@ -103,12 +112,21 @@ func Open(ctx context.Context, deps Deps) (opened *Store, err error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	now := deps.Now
+	if now == nil {
+		now = time.Now
+	}
 	s := &Store{
 		lock:               lock,
 		log:                log,
 		fatal:              deps.Fatal,
 		queue:              make(chan writeRequest, deps.WriteQueue),
 		checkpointInterval: deps.CheckpointInterval,
+		backupDir:          filepath.Join(dir, "backup"),
+		backupKeep:         deps.BackupKeep,
+		now:                now,
+		maintenance:        make(chan struct{}, 1),
+		closing:            make(chan struct{}),
 		stopped:            make(chan struct{}),
 	}
 	defer func() {
@@ -176,6 +194,8 @@ func validateDeps(deps Deps) error {
 		return fmt.Errorf("store write queue capacity must be between 1 and %d: %d", maxWriteQueue, deps.WriteQueue)
 	case deps.CheckpointInterval <= 0:
 		return fmt.Errorf("store checkpoint interval must be positive: %s", deps.CheckpointInterval)
+	case deps.BackupKeep <= 0:
+		return fmt.Errorf("store backup retention must be positive: %d", deps.BackupKeep)
 	case deps.Metrics == nil:
 		return errors.New("store metrics set must not be nil")
 	case isNilHealthRegistry(deps.Health):
@@ -232,6 +252,9 @@ func (s *Store) Start(context.Context) error {
 	if s.writerDone != nil {
 		return errors.New("store has already started")
 	}
+	if s.migrating {
+		return errors.New("store migration is in progress")
+	}
 	checkpointCtx, cancelCheckpoint := context.WithCancel(context.Background())
 	s.cancelCheckpoint = cancelCheckpoint
 	s.writerDone = make(chan struct{})
@@ -241,12 +264,13 @@ func (s *Store) Start(context.Context) error {
 	return nil
 }
 
-// Stop drains accepted writes, stops the checkpointer, closes the pools and releases the directory lock in that order.
-// If ctx ends first, cleanup continues in the background.
+// Stop drains accepted writes, stops the checkpointer and waits for active backup or migration work before closing the pools.
+// It releases the directory lock last. If ctx ends first, cleanup continues in the background.
 func (s *Store) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if !s.isStopping {
 		s.isStopping = true
+		close(s.closing)
 		close(s.queue)
 		go s.finishStop(s.writerDone)
 	}
@@ -271,8 +295,39 @@ func (s *Store) finishStop(writerDone <-chan struct{}) {
 		s.cancelCheckpoint()
 		<-s.checkpointDone
 	}
+	s.maintenance <- struct{}{}
 	s.stopErr = s.close()
+	<-s.maintenance
 	close(s.stopped)
+}
+
+func (s *Store) beginMaintenance(ctx context.Context) error {
+	if s == nil || s.maintenance == nil {
+		return errors.New("store is not open")
+	}
+	select {
+	case <-s.closing:
+		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.maintenance <- struct{}{}:
+	}
+	// Recheck after acquiring the slot because select can choose any ready case.
+	select {
+	case <-s.closing:
+		s.endMaintenance()
+		return ErrClosed
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		s.endMaintenance()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) endMaintenance() {
+	<-s.maintenance
 }
 
 func (s *Store) checkHealth() error {

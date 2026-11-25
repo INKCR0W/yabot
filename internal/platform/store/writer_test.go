@@ -552,6 +552,7 @@ func TestWriterCommitSurvivesCrashBeforeDone(t *testing.T) {
 			CacheKiB:           8000,
 			WriteQueue:         16,
 			CheckpointInterval: 500 * time.Millisecond,
+			BackupKeep:         7,
 			Metrics:            metrics.NewSet(),
 			Health:             &testHealthRegistry{},
 			Fatal:              func(_ string, err error) { t.Errorf("store faulted: %v", err) },
