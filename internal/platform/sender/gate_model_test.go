@@ -156,9 +156,8 @@ func checkRateGateSequence(t *testing.T, random *rand.Rand) {
 		history = append(history, event)
 		pauses = modelGatePauses(history)
 		want := gateUpdate{
-			methodUntil:   modelGateTime(start, modelActivePause(at, pauses.methods[event.class])),
-			globalUntil:   modelGateTime(start, pauses.globalAt(at)),
-			enteredGlobal: before.globalAt(at) == 0 && pauses.globalAt(at) != 0,
+			methodUntil: modelGateTime(start, modelActivePause(at, pauses.methods[event.class])),
+			globalUntil: modelGateTime(start, pauses.globalAt(at)),
 		}
 		if pauses.chats[event.chatID] > before.chats[event.chatID] {
 			want.chatUntil = modelGateTime(start, pauses.chats[event.chatID])

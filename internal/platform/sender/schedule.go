@@ -163,7 +163,7 @@ func (s *Sender) promoteRetries(now time.Time) {
 }
 
 func (s *Sender) requeue(entry *item) {
-	s.queue.pushFront(entry)
+	s.queue.requeue(entry)
 	class := entry.request.Class
 	s.metrics.setDepth(class, s.queue.depth(class))
 }

@@ -103,7 +103,6 @@ func TestRateGateRetryAfter(t *testing.T) {
 			}
 			if tc.global {
 				want.globalUntil = until
-				want.enteredGlobal = true
 				wantCounts.global = 1
 			}
 			if got := gate.record429(now, tc.chatID, methodMessage, tc.retryAfter); got != want {
@@ -135,7 +134,7 @@ func TestRateGateAllMethodsPaused(t *testing.T) {
 			gate.record429(now, 0, methodOther, 5*time.Second)
 			update := gate.record429(now, 0, methodMessage, 3*time.Second)
 			until := now.Add(max(3*time.Second, explicitDelay))
-			if !update.globalUntil.Equal(until) || !update.methodUntil.Equal(first) || update.enteredGlobal != (explicitDelay == 0) {
+			if !update.globalUntil.Equal(until) || !update.methodUntil.Equal(first) {
 				t.Fatalf("record429() = %+v, want method until %v and global until %v", update, first, until)
 			}
 			got, paused := gate.globalPause(until.Add(-time.Nanosecond))
@@ -209,7 +208,6 @@ func TestRateGatePauseExtension(t *testing.T) {
 				}
 				if tc.global {
 					want.globalUntil = until
-					want.enteredGlobal = event.offset == 0
 				}
 				if got != want {
 					t.Fatalf("record429() at %v = %+v, want %+v", event.offset, got, want)

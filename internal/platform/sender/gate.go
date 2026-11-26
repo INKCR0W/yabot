@@ -24,9 +24,8 @@ type gateUpdate struct {
 	// chatUntil is set only when the input chat is newly paused or its pause is extended.
 	chatUntil time.Time
 	// methodUntil and globalUntil report active pauses after the update. Zero means inactive.
-	methodUntil   time.Time
-	globalUntil   time.Time
-	enteredGlobal bool
+	methodUntil time.Time
+	globalUntil time.Time
 }
 
 type gateCounts struct {
@@ -36,7 +35,6 @@ type gateCounts struct {
 }
 
 func (g *rateGate) record429(now time.Time, chatID int64, class methodClass, retryAfter time.Duration) gateUpdate {
-	_, wasGlobal := g.globalPause(now)
 	if retryAfter <= 0 {
 		retryAfter = time.Second
 	}
@@ -60,9 +58,7 @@ func (g *rateGate) record429(now time.Time, chatID int64, class methodClass, ret
 		g.globalUntil = laterPause(g.globalUntil, until)
 	}
 	update.methodUntil = activePause(now, g.methods[class])
-	globalUntil, isGlobal := g.globalPause(now)
-	update.globalUntil = globalUntil
-	update.enteredGlobal = isGlobal && !wasGlobal
+	update.globalUntil, _ = g.globalPause(now)
 	return update
 }
 

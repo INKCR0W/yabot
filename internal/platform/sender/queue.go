@@ -15,6 +15,7 @@ const (
 type item struct {
 	request           Request
 	method            methodClass
+	admissionSeq      uint64
 	enqueuedAt        time.Time
 	retryAt           time.Time
 	result            Result
@@ -23,12 +24,13 @@ type item struct {
 
 // queue needs external synchronization. Callers must validate classes and keep queued requests unchanged.
 type queue struct {
-	classes [Background + 1]classQueue
-	current Class
-	chatCap int
-	parked  map[int64]struct{}
-	weights map[int64]*chatWeight
-	expiry  weightHeap
+	classes          [Background + 1]classQueue
+	current          Class
+	chatCap          int
+	lastAdmissionSeq uint64
+	parked           map[int64]struct{}
+	weights          map[int64]*chatWeight
+	expiry           weightHeap
 }
 
 type classQueue struct {
@@ -73,12 +75,22 @@ func (q *queue) push(entry *item) error {
 	if q.chatLen(class, chatID) >= q.chatCap {
 		return ErrBusy
 	}
+	q.lastAdmissionSeq++
+	entry.admissionSeq = q.lastAdmissionSeq
 	q.chatForPush(class, chatID).items.PushBack(entry)
 	return nil
 }
 
-func (q *queue) pushFront(entry *item) {
-	q.chatForPush(entry.request.Class, entry.request.ChatID).items.PushFront(entry)
+// requeue restores a previously admitted item without applying the admission limit.
+func (q *queue) requeue(entry *item) {
+	chat := q.chatForPush(entry.request.Class, entry.request.ChatID)
+	for elem := chat.items.Front(); elem != nil; elem = elem.Next() {
+		if elem.Value.(*item).admissionSeq > entry.admissionSeq {
+			chat.items.InsertBefore(entry, elem)
+			return
+		}
+	}
+	chat.items.PushBack(entry)
 }
 
 func (q *queue) chatForPush(class Class, chatID int64) *chatQueue {

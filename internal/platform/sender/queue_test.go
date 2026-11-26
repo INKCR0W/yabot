@@ -360,6 +360,10 @@ func TestQueueSmallChatsMeetDeadlinesUnderContinuousLoad(t *testing.T) {
 func TestQueueFIFOAndCapacity(t *testing.T) {
 	q := testQueue(256)
 	now := time.Unix(10, 0)
+	retry := pushItems(t, q, Decision, -1, 1, time.Time{})[0]
+	if got := mustTake(t, q, now, nil); got != retry {
+		t.Fatalf("first take = %p, want %p", got, retry)
+	}
 	want := pushItems(t, q, Decision, -1, 256, time.Time{})
 	rejected := &item{request: Request{Class: Decision, ChatID: -1}}
 	if err := q.push(rejected); !errors.Is(err, ErrBusy) {
@@ -368,8 +372,7 @@ func TestQueueFIFOAndCapacity(t *testing.T) {
 	if depth, chatLen := q.depth(Decision), q.chatLen(Decision, -1); depth != 256 || chatLen != 256 {
 		t.Fatalf("after rejected push: depth = %d, chatLen = %d, want 256 each", depth, chatLen)
 	}
-	retry := &item{request: rejected.request}
-	q.pushFront(retry)
+	q.requeue(retry)
 	if depth, chatLen := q.depth(Decision), q.chatLen(Decision, -1); depth != 257 || chatLen != 257 {
 		t.Fatalf("after retry: depth = %d, chatLen = %d, want 257 each", depth, chatLen)
 	}
@@ -387,6 +390,40 @@ func TestQueueFIFOAndCapacity(t *testing.T) {
 	}
 	if got, expired := q.next(now, nil); got != nil || len(expired) != 0 {
 		t.Fatalf("after drain next = %p, %v, want empty", got, expired)
+	}
+}
+
+func TestQueueRequeuePreservesAdmissionOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		admitted    int
+		returnOrder []int
+	}{
+		{"head", 3, []int{0}},
+		{"middle", 4, []int{0, 2, 1}},
+		{"empty chat rejoins ring", 3, []int{1, 0, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Unix(10, 0)
+			q := testQueue(256)
+			items := pushItems(t, q, Decision, 1, tc.admitted, time.Time{})
+			for i, want := range items[:len(tc.returnOrder)] {
+				if got := mustTake(t, q, now, nil); got != want {
+					t.Fatalf("initial take %d = %p, want %p", i, got, want)
+				}
+			}
+			for _, i := range tc.returnOrder {
+				q.requeue(items[i])
+			}
+			for i, want := range items {
+				if got := mustTake(t, q, now, nil); got != want {
+					t.Fatalf("take %d after requeue = %p, want %p", i, got, want)
+				}
+			}
+			if got, expired := q.next(now, nil); got != nil || len(expired) != 0 {
+				t.Fatalf("after drain next = %p, %v, want empty", got, expired)
+			}
+		})
 	}
 }
 
@@ -652,6 +689,10 @@ func TestQueueContinuesAfterExpiredChatLeavesRing(t *testing.T) {
 func TestQueueParkAndUnpark(t *testing.T) {
 	q := testQueue(256)
 	now := time.Unix(10, 0)
+	retry := pushItems(t, q, Background, 0, 1, time.Time{})[0]
+	if got := mustTake(t, q, now, nil); got != retry {
+		t.Fatalf("first take = %p, want %p", got, retry)
+	}
 	expiredItems := pushItems(t, q, Deadline, 0, 1, now)
 	decision := pushItems(t, q, Decision, 0, 1, time.Time{})[0]
 	interactive := pushItems(t, q, Interactive, 0, 1, now.Add(time.Second))[0]
@@ -661,8 +702,7 @@ func TestQueueParkAndUnpark(t *testing.T) {
 	q.park(2)
 	newWhileParked := pushItems(t, q, Decision, 2, 1, time.Time{})[0]
 	live := pushItems(t, q, Deadline, 0, 1, now.Add(time.Second))[0]
-	retry := &item{request: background.request}
-	q.pushFront(retry)
+	q.requeue(retry)
 	other := pushItems(t, q, Deadline, 1, 1, now.Add(time.Second))[0]
 	if got := mustTake(t, q, now, nil); got != other {
 		t.Fatalf("while parked next = %p, want %p", got, other)

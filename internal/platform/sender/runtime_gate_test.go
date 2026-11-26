@@ -904,6 +904,11 @@ func TestSenderGateRuntime429Requeues(t *testing.T) {
 		synctest.Wait()
 		second, secondDone := gateRuntimeRequest(Decision, 4, "getChat", time.Time{})
 		gateRuntimeEnqueue(t, s, second)
+		synctest.Wait()
+		if got := s.ClassWait(Decision); got != time.Second {
+			t.Errorf("Decision backlog before the 429 = %v, want one untouched request", got)
+		}
+		gateRuntimePending(t, secondDone)
 		close(release)
 		synctest.Wait()
 		if got := s.ClassWait(Decision); got != 2*time.Second {
@@ -958,6 +963,55 @@ func TestSenderGateRuntimeNoSpin(t *testing.T) {
 		synctest.Wait()
 		if r := gateRuntimeResult(t, secondDone); r.Outcome.Class != telegram.OK {
 			t.Fatalf("chat bucket recovery result = %+v", r)
+		}
+	})
+}
+
+func TestSenderGateRuntimeAllBackloggedChatsPausedNoSpin(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := gateRuntimeStart(t, gateRuntimeDeps(t))
+		defer gateRuntimeStop(t, s)
+		chats := [...]int64{-1, -2}
+		for _, chat := range chats {
+			trigger, done := gateRuntimeRequest(Decision, chat, "getChat", time.Time{})
+			trigger.Do = func(context.Context, *bot.Bot) error {
+				return &bot.TooManyRequestsError{RetryAfter: 1}
+			}
+			gateRuntimeEnqueue(t, s, trigger)
+			synctest.Wait()
+			if got := gateRuntimeResult(t, done); got.Outcome.RetryAfter != time.Second {
+				t.Fatalf("chat %d pause trigger = %+v, want 1s RetryAfter", chat, got)
+			}
+		}
+		var backlog [len(chats)]<-chan Result
+		for i, chat := range chats {
+			r, done := gateRuntimeRequest(Decision, chat, "getChat", time.Time{})
+			backlog[i] = done
+			gateRuntimeEnqueue(t, s, r)
+		}
+		synctest.Wait()
+		s.mu.Lock()
+		before := s.loops
+		s.mu.Unlock()
+
+		time.Sleep(time.Second - time.Nanosecond)
+		synctest.Wait()
+		for _, done := range backlog {
+			gateRuntimePending(t, done)
+		}
+		s.mu.Lock()
+		loops := s.loops - before
+		s.mu.Unlock()
+		if loops > 3 {
+			t.Errorf("scheduler ran %d iterations while every backlogged chat was paused, want at most 3", loops)
+		}
+
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		for i, done := range backlog {
+			if got := gateRuntimeResult(t, done); got.Outcome.Class != telegram.OK || got.Dropped != 0 || got.Attempts != 1 {
+				t.Errorf("chat %d after recovery = %+v, want success in one attempt", chats[i], got)
+			}
 		}
 	})
 }
