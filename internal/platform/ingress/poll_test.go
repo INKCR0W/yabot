@@ -515,3 +515,20 @@ func assertPollMetric(t *testing.T, set *metrics.Set, name string, want float64)
 	}
 	t.Errorf("metric %s missing, want %v", name, want)
 }
+
+func TestPollWebhookHonorsRetryAfter(t *testing.T) {
+	h := newPollHarness(t)
+	h.deps.RetryDelay = 20 * time.Millisecond
+	i := h.start(t)
+	sentAt := time.Now()
+	h.next(t, "deleteWebhook").respond(http.StatusTooManyRequests,
+		`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`, false)
+	retry := h.next(t, "deleteWebhook")
+	if elapsed := retry.at.Sub(sentAt); elapsed < time.Second {
+		t.Fatalf("deleteWebhook retried after %v, want at least retry_after 1s", elapsed)
+	}
+	retry.ok("true")
+	h.next(t, "getUpdates")
+	h.stop(t, i)
+	assertPollMetric(t, h.metrics, "yabot_ingress_delete_webhook_retries_total", 1)
+}
