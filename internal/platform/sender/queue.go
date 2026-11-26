@@ -13,7 +13,12 @@ const (
 )
 
 type item struct {
-	request Request
+	request           Request
+	method            methodClass
+	enqueuedAt        time.Time
+	retryAt           time.Time
+	result            Result
+	expireOnAdmission bool
 }
 
 // queue needs external synchronization. Callers must validate classes and keep queued requests unchanged.
@@ -267,6 +272,10 @@ func (q *queue) depth(class Class) int {
 	return q.classes[class].depth
 }
 
+func (q *queue) empty() bool {
+	return q.depth(Deadline)+q.depth(Decision)+q.depth(Interactive)+q.depth(Background) == 0
+}
+
 func (q *queue) chatLen(class Class, chatID int64) int {
 	if chat := q.classes[class].chats[chatID]; chat != nil {
 		return chat.items.Len()
@@ -404,17 +413,27 @@ func (q *queue) queueWait(class Class, chatID int64, now time.Time, globalRPS fl
 	if !(globalRPS > 0) {
 		return time.Duration(math.MaxInt64)
 	}
+	// The target's weight cancels from its own contribution, including when it is outside the ring.
+	chatFactor := 1 + q.otherChatWeight(class, chatID)/q.weightFor(class, chatID)
+	return waitAtRate((float64(q.chatLen(class, chatID))+1)*chatFactor, q.classShare(class), globalRPS)
+}
+
+func (q *queue) classWait(class Class, globalRPS float64) time.Duration {
+	return waitAtRate(float64(q.depth(class)), q.classShare(class), globalRPS)
+}
+
+func (q *queue) classShare(class Class) float64 {
 	var totalClassWeight float64
 	for c := Deadline; c <= Background; c++ {
 		if c == class || q.depth(c) > 0 {
 			totalClassWeight += float64(q.classes[c].quantum)
 		}
 	}
+	return float64(q.classes[class].quantum) / totalClassWeight
+}
 
-	// The target's weight cancels from its own contribution, including when it is outside the ring.
-	chatFactor := 1 + q.otherChatWeight(class, chatID)/q.weightFor(class, chatID)
-	work := (float64(q.chatLen(class, chatID)) + 1) * float64(time.Second) * totalClassWeight * chatFactor
-	ns := math.Round(work / float64(q.classes[class].quantum) / globalRPS)
+func waitAtRate(work, share, globalRPS float64) time.Duration {
+	ns := math.Round(work * float64(time.Second) / share / globalRPS)
 	if ns >= float64(math.MaxInt64) {
 		return time.Duration(math.MaxInt64)
 	}

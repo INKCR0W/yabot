@@ -23,15 +23,22 @@ func (class methodClass) String() string {
 }
 
 func classifyMethod(method string) methodClass {
+	class, _ := methodInfo(method)
+	return class
+}
+
+func methodInfo(method string) (methodClass, string) {
 	switch method {
 	case "sendChatJoinRequestWebApp", "answerChatJoinRequestQuery", "approveChatJoinRequest", "declineChatJoinRequest":
-		return methodJoinRequest
+		return methodJoinRequest, method
 	case "sendMessage", "editMessageText", "editMessageReplyMarkup", "editMessageCaption", "editMessageMedia",
 		"sendPhoto", "sendDocument", "sendVideo", "sendAnimation", "sendAudio", "sendVoice", "sendSticker",
 		"sendMediaGroup", "copyMessage", "forwardMessage":
-		return methodMessage
+		return methodMessage, method
+	case "getChat", "getChatMember", "getChatAdministrators", "leaveChat", "deleteMessage":
+		return methodOther, method
 	default:
-		return methodOther
+		return methodOther, "other"
 	}
 }
 

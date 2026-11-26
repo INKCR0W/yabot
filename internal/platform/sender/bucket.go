@@ -132,6 +132,12 @@ func (b *chatBuckets) take(now time.Time, chatID int64, class methodClass) bool 
 	return bucket.take(now)
 }
 
+func (b *chatBuckets) refund(now time.Time, chatID int64, class methodClass) {
+	if bucket := b.find(chatBucketKey{kind: class.bucketKind(chatID), chatID: chatID}); bucket != nil {
+		bucket.refund(now)
+	}
+}
+
 func (b *chatBuckets) next(now time.Time, chatID int64, class methodClass) (time.Time, bool) {
 	bucket := b.find(chatBucketKey{kind: class.bucketKind(chatID), chatID: chatID})
 	if bucket == nil {

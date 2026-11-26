@@ -88,6 +88,11 @@ type Result struct {
 	Dropped DropReason
 }
 
+// DroppedResult constructs a dropped result with a Retry outcome.
+func DroppedResult(reason DropReason, err error) Result {
+	return Result{Outcome: telegram.Outcome{Class: telegram.Retry}, Dropped: reason, Err: err}
+}
+
 var (
 	ErrWouldMiss      = errors.New("sender: request would miss its deadline")
 	ErrBusy           = errors.New("sender: chat queue is full")

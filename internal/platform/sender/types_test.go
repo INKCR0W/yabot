@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/go-telegram/bot"
+
+	"github.com/INKCR0W/yabot/internal/platform/telegram"
 )
 
 func TestClassString(t *testing.T) {
@@ -44,6 +46,18 @@ func TestDropReasonString(t *testing.T) {
 		if got := testCase.reason.String(); got != testCase.want {
 			t.Errorf("DropReason(%d).String() = %q, want %q", testCase.reason, got, testCase.want)
 		}
+	}
+}
+
+func TestDroppedResult(t *testing.T) {
+	for _, reason := range []DropReason{Busy, Expired, Shutdown} {
+		t.Run(reason.String(), func(t *testing.T) {
+			err := errors.New("original failure")
+			result := DroppedResult(reason, err)
+			if result.Outcome.Class != telegram.Retry || result.Dropped != reason || result.Err != err {
+				t.Errorf("DroppedResult(%v, %v) = %+v, want Retry with the same drop reason and error", reason, err, result)
+			}
+		})
 	}
 }
 
