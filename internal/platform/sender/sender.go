@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -41,10 +42,11 @@ const (
 
 // Sender must be constructed with New and cannot be restarted after Stop.
 type Sender struct {
-	deps    Deps
-	metrics senderMetrics
-	wake    chan struct{}
-	done    chan struct{}
+	deps             Deps
+	metrics          senderMetrics
+	wake             chan struct{}
+	done             chan struct{}
+	healthPauseUntil atomic.Pointer[time.Time]
 
 	mu          sync.Mutex
 	state       senderState
@@ -138,6 +140,16 @@ func validateDeps(deps Deps) error {
 }
 
 func (*Sender) Name() string { return "sender" }
+
+// HealthCheck reports an active global pause without waiting for the scheduler.
+// The error text starts with "degraded:" and names the UTC resume time.
+func (s *Sender) HealthCheck() error {
+	now := time.Now()
+	if until := s.healthPauseUntil.Load(); until != nil && now.Before(*until) {
+		return fmt.Errorf("degraded: sender globally paused until %s", until.UTC().Format(time.RFC3339Nano))
+	}
+	return nil
+}
 
 // Start succeeds at most once. Cancellation of ctx does not stop the sender.
 func (s *Sender) Start(ctx context.Context) error {

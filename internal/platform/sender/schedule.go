@@ -200,13 +200,17 @@ func (s *Sender) record429(now time.Time, chat int64, method methodClass, retryA
 	methodUntil := activePause(now, s.gate.methods[method])
 	globalUntil, _ := s.gate.globalPause(now)
 	update := s.gate.record429(now, chat, method, retryAfter)
+	globalExtended := update.globalUntil.After(globalUntil)
+	if globalExtended {
+		until := update.globalUntil
+		s.healthPauseUntil.Store(&until)
+	}
 	s.observeGate(now)
 	chatExtended := !update.chatUntil.IsZero()
 	if chatExtended {
 		s.queue.park(chat)
 	}
 	methodExtended := update.methodUntil.After(methodUntil)
-	globalExtended := update.globalUntil.After(globalUntil)
 	if !chatExtended && !methodExtended && !globalExtended {
 		return
 	}
