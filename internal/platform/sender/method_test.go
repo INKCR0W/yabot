@@ -2,6 +2,19 @@ package sender
 
 import "testing"
 
+func (class methodClass) String() string {
+	switch class {
+	case methodJoinRequest:
+		return "join_request"
+	case methodMessage:
+		return "message"
+	case methodOther:
+		return "other"
+	default:
+		return "unknown"
+	}
+}
+
 func TestClassifyMethod(t *testing.T) {
 	tests := []struct {
 		class   methodClass
@@ -24,7 +37,7 @@ func TestClassifyMethod(t *testing.T) {
 		t.Run(tt.label, func(t *testing.T) {
 			for _, method := range tt.methods {
 				class := classifyMethod(method)
-				if class != tt.class || class.String() != tt.label {
+				if class != tt.class {
 					t.Errorf("classifyMethod(%q) = %s (%d), want %s (%d)", method, class, class, tt.label, tt.class)
 				}
 			}

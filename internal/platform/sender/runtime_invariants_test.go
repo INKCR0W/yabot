@@ -198,9 +198,10 @@ func TestRuntimeAttemptCleanupAndLogs(t *testing.T) {
 		attemptErr error
 		panicDone  bool
 		wantLog    string
+		wantCause  string
 	}{
-		{"fatal attempt", errors.New("attempt failure sentinel"), false, `"level":"WARN","msg":"sender request failed"`},
-		{"panicking callback", nil, true, `"level":"ERROR","msg":"sender Done callback panicked"`},
+		{"fatal attempt", errors.New("attempt failure sentinel"), false, `"level":"ERROR","msg":"sender request failed"`, `"error":"attempt failure sentinel"`},
+		{"panicking callback", nil, true, `"level":"ERROR","msg":"sender Done callback panicked"`, `"panic":"callback failure sentinel"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -223,7 +224,8 @@ func TestRuntimeAttemptCleanupAndLogs(t *testing.T) {
 				}))
 				synctest.Wait()
 				got := logs.String()
-				if strings.Count(got, "\n") != 1 || !strings.Contains(got, tc.wantLog) || !strings.Contains(got, `"method":"getChat","chat_id":42`) {
+				if strings.Count(got, "\n") != 1 || !strings.Contains(got, tc.wantLog) || !strings.Contains(got, `"method":"getChat","chat_id":42`) ||
+					!strings.Contains(got, tc.wantCause) {
 					t.Errorf("logs = %s, want one diagnostic for getChat in chat 42", got)
 				}
 			})

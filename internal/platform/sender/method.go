@@ -9,19 +9,6 @@ const (
 	methodClassCount
 )
 
-func (class methodClass) String() string {
-	switch class {
-	case methodJoinRequest:
-		return "join_request"
-	case methodMessage:
-		return "message"
-	case methodOther:
-		return "other"
-	default:
-		return "unknown"
-	}
-}
-
 func classifyMethod(method string) methodClass {
 	class, _ := methodInfo(method)
 	return class

@@ -181,10 +181,12 @@ func (s *Sender) Enqueue(r Request) error {
 	now := time.Now()
 	method := classifyMethod(r.Method)
 	if r.Class == Deadline && s.wouldMiss(now, r.Class, r.ChatID, method, r.Deadline) {
+		s.metrics.countDrop(r.Class, "would_miss")
 		return ErrWouldMiss
 	}
 	entry := &item{request: r, method: method, enqueuedAt: now}
 	if err := s.queue.push(entry); err != nil {
+		s.metrics.countDrop(r.Class, Busy.String())
 		return err
 	}
 	if _, expires := s.pauseStatus(now, entry); expires {

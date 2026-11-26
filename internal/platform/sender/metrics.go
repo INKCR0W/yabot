@@ -64,15 +64,20 @@ func (m *senderMetrics) countAttempt(r Request, outcome telegram.Class) {
 }
 
 func (m *senderMetrics) countResult(class Class, reason DropReason, latency time.Duration) {
-	if m.set == nil {
-		return
-	}
 	if reason != 0 {
-		m.set.GetOrCreateCounter(`yabot_sender_dropped_total{class="` + class.String() +
-			`",reason="` + reason.String() + `"}`).Inc()
+		m.countDrop(class, reason.String())
 		return
 	}
-	m.latency[class].Update(latency.Seconds())
+	if m.set != nil {
+		m.latency[class].Update(latency.Seconds())
+	}
+}
+
+func (m *senderMetrics) countDrop(class Class, reason string) {
+	if m.set != nil {
+		m.set.GetOrCreateCounter(`yabot_sender_dropped_total{class="` + class.String() +
+			`",reason="` + reason + `"}`).Inc()
+	}
 }
 
 func (m *senderMetrics) countCallbackPanic() {

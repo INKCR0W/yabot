@@ -143,7 +143,7 @@ func (s *Sender) finishAttempt(run *call, outcome telegram.Outcome, err error) {
 
 	s.metrics.countAttempt(r, outcome.Class)
 	if outcome.Class == telegram.Fatal {
-		s.deps.Log.Warn("sender request failed", "method", r.Method, "chat_id", r.ChatID, "error", err)
+		s.deps.Log.Error("sender request failed", "method", r.Method, "chat_id", r.ChatID, "error", err)
 	}
 	if complete {
 		s.deliver(completion{entry, result}, now)

@@ -89,6 +89,7 @@ type Result struct {
 }
 
 // DroppedResult constructs a dropped result with a Retry outcome.
+// Enqueue already counts ErrBusy and ErrWouldMiss rejections.
 func DroppedResult(reason DropReason, err error) Result {
 	return Result{Outcome: telegram.Outcome{Class: telegram.Retry}, Dropped: reason, Err: err}
 }

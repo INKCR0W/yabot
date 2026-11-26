@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -137,6 +138,7 @@ func TestSenderGateRuntimeEnqueueErrors(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := gateRuntimeDeps(t)
 		d.ChatQueue = 1
+		d.Metrics = metrics.NewSet()
 		s, err := New(d)
 		if err != nil {
 			t.Fatal(err)
@@ -148,10 +150,29 @@ func TestSenderGateRuntimeEnqueueErrors(t *testing.T) {
 				t.Fatalf("Enqueue error = %v, want %v", err, want)
 			}
 		}
+		checkDrops := func(want ...string) {
+			t.Helper()
+			var body bytes.Buffer
+			d.Metrics.WritePrometheus(&body)
+			var got []string
+			for line := range strings.SplitSeq(body.String(), "\n") {
+				if strings.HasPrefix(line, "yabot_sender_dropped_total{") {
+					got = append(got, line)
+				}
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, want) {
+				t.Errorf("drop metrics = %q, want %q", got, want)
+			}
+		}
+		const backgroundBusy = `yabot_sender_dropped_total{class="background",reason="busy"} 1`
+		const deadlineBusy = `yabot_sender_dropped_total{class="deadline",reason="busy"} 1`
+		const deadlineMiss = `yabot_sender_dropped_total{class="deadline",reason="would_miss"} 1`
 		check(rejected, ErrClosed)
 		invalid := rejected
 		invalid.Method = ""
 		check(invalid, ErrInvalidRequest)
+		checkDrops()
 		if err := s.Start(t.Context()); err != nil {
 			t.Fatal(err)
 		}
@@ -169,6 +190,7 @@ func TestSenderGateRuntimeEnqueueErrors(t *testing.T) {
 			change(&r)
 			check(r, ErrInvalidRequest)
 		}
+		checkDrops()
 		blocked, blockedDone := gateRuntimeRequest(Background, 99, "getChat", time.Time{})
 		release := make(chan struct{})
 		blocked.Do = func(ctx context.Context, _ *bot.Bot) error {
@@ -184,14 +206,24 @@ func TestSenderGateRuntimeEnqueueErrors(t *testing.T) {
 		queued, queuedDone := gateRuntimeRequest(Background, 1, "getChat", time.Time{})
 		gateRuntimeEnqueue(t, s, queued)
 		check(rejected, ErrBusy)
+		checkDrops(backgroundBusy)
 		gateRuntimePending(t, queuedDone)
 		fullDeadline, fullDeadlineDone := gateRuntimeRequest(Deadline, 1, "answerChatJoinRequestQuery", time.Now().Add(time.Second))
 		gateRuntimeEnqueue(t, s, fullDeadline)
 		miss := rejected
 		miss.Class, miss.Method, miss.Deadline = fullDeadline.Class, fullDeadline.Method, time.Now()
+		if !s.WouldMiss(miss.Class, miss.ChatID, miss.Deadline) {
+			t.Fatal("WouldMiss returned false for an expired deadline")
+		}
+		checkDrops(backgroundBusy)
 		check(miss, ErrWouldMiss)
+		checkDrops(backgroundBusy, deadlineMiss)
 		miss.Deadline = fullDeadline.Deadline
 		check(miss, ErrBusy)
+		checkDrops(backgroundBusy, deadlineBusy, deadlineMiss)
+		DroppedResult(Busy, ErrBusy)
+		DroppedResult(Expired, ErrWouldMiss)
+		checkDrops(backgroundBusy, deadlineBusy, deadlineMiss)
 		close(release)
 		synctest.Wait()
 		for _, done := range []<-chan Result{blockedDone, queuedDone, fullDeadlineDone} {
@@ -202,6 +234,7 @@ func TestSenderGateRuntimeEnqueueErrors(t *testing.T) {
 		gateRuntimeStop(t, s)
 		check(rejected, ErrClosed)
 		check(invalid, ErrInvalidRequest)
+		checkDrops(backgroundBusy, deadlineBusy, deadlineMiss)
 		gateRuntimePending(t, rejectedDone)
 	})
 }
