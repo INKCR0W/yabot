@@ -67,16 +67,17 @@ func (r *dedupeRing) add(id int64) {
 	r.next = (r.next + 1) % len(r.ids)
 }
 
-func (i *Ingress) settleBatch(ctx context.Context, state *batchState, updates []models.Update, deadline time.Time) (bool, error) {
+func (i *Ingress) settleBatch(ctx context.Context, state *batchState, updates []models.Update, received time.Time) (bool, error) {
 	type routedUpdate struct {
 		update  *models.Update
 		receipt dispatch.Receipt
 	}
+	deadline := received.Add(i.deps.SettleTimeout)
 	pending := make([]routedUpdate, 0, len(updates))
 	for idx := range updates {
 		update := &updates[idx]
 		if !state.dedupe.has(update.ID) {
-			pending = append(pending, routedUpdate{update: update, receipt: i.deps.Router.Accept(update)})
+			pending = append(pending, routedUpdate{update: update, receipt: i.deps.Router.Accept(update, received)})
 		}
 	}
 	batchOK := true

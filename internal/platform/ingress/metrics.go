@@ -14,13 +14,15 @@ const (
 )
 
 type ingressMetrics struct {
-	set           *metrics.Set
-	lagSeconds    *metrics.Histogram
-	settleSeconds *metrics.Histogram
-	batchSize     *metrics.Histogram
-	fullRatio     *metrics.Gauge
-	poison        *metrics.Counter
-	deadLetters   *metrics.Counter
+	set            *metrics.Set
+	lagSeconds     *metrics.Histogram
+	settleSeconds  *metrics.Histogram
+	batchSize      *metrics.Histogram
+	fullRatio      *metrics.Gauge
+	poison         *metrics.Counter
+	deadLetters    *metrics.Counter
+	pollRetries    *metrics.Counter
+	webhookRetries *metrics.Counter
 
 	fullBatches [batchWindowSize]bool
 	nextBatch   int
@@ -33,13 +35,15 @@ func newIngressMetrics(set *metrics.Set) ingressMetrics {
 		return ingressMetrics{}
 	}
 	return ingressMetrics{
-		set:           set,
-		lagSeconds:    set.GetOrCreateHistogram("yabot_ingress_lag_seconds"),
-		settleSeconds: set.GetOrCreateHistogram("yabot_ingress_settle_seconds"),
-		batchSize:     set.GetOrCreateHistogram("yabot_ingress_batch_size"),
-		fullRatio:     set.GetOrCreateGauge("yabot_ingress_full_batch_ratio", nil),
-		poison:        set.GetOrCreateCounter("yabot_ingress_poison_total"),
-		deadLetters:   set.GetOrCreateCounter("yabot_ingress_dead_letters_total"),
+		set:            set,
+		lagSeconds:     set.GetOrCreateHistogram("yabot_ingress_lag_seconds"),
+		settleSeconds:  set.GetOrCreateHistogram("yabot_ingress_settle_seconds"),
+		batchSize:      set.GetOrCreateHistogram("yabot_ingress_batch_size"),
+		fullRatio:      set.GetOrCreateGauge("yabot_ingress_full_batch_ratio", nil),
+		poison:         set.GetOrCreateCounter("yabot_ingress_poison_total"),
+		deadLetters:    set.GetOrCreateCounter("yabot_ingress_dead_letters_total"),
+		pollRetries:    set.GetOrCreateCounter("yabot_ingress_poll_retries_total"),
+		webhookRetries: set.GetOrCreateCounter("yabot_ingress_delete_webhook_retries_total"),
 	}
 }
 

@@ -114,7 +114,7 @@ func TestRouterCompletionPanicSettlesCriticalAck(t *testing.T) {
 		deps.Metrics = metrics.NewSet()
 		d := startTestDispatcher(t, deps)
 		r := NewRouter(d, RouterDeps{})
-		r.Register(routerTestRoute("critical", true, func(_ context.Context, sh *Shard, _ *models.Update, ack Ack) {
+		r.Register(routerTestRoute("critical", true, func(_ context.Context, sh *Shard, _ *models.Update, _ time.Time, ack Ack) {
 			ticket, ok := sh.Admit()
 			if !ok {
 				ack.Done(ErrBusy)
@@ -127,7 +127,7 @@ func TestRouterCompletionPanicSettlesCriticalAck(t *testing.T) {
 			}()
 		}))
 
-		rc := r.Accept(&models.Update{ID: 48, Message: &models.Message{}})
+		rc := r.Accept(&models.Update{ID: 48, Message: &models.Message{}}, time.Time{})
 		err := rc.Wait(time.Second)
 		if !IsPermanent(err) {
 			t.Errorf("Wait = %v, want permanent error", err)

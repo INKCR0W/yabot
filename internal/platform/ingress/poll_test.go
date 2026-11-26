@@ -22,6 +22,11 @@ import (
 
 func TestPollSettlesWholeBatch(t *testing.T) {
 	h := newPollHarness(t)
+	h.deps.Router = observingRouter{Router: h.router, onAccept: func(u *models.Update, recvAt time.Time) {
+		if recvAt == recvAt.Round(0) {
+			t.Errorf("update %d received time %v without a monotonic reading", u.ID, recvAt)
+		}
+	}}
 	type delivery struct {
 		id  int64
 		ack dispatch.Ack
@@ -124,7 +129,7 @@ func TestPollStopWaitsAndConfirmsOffset(t *testing.T) {
 			return true
 		},
 		Key: func(*models.Update) dispatch.Key { return dispatch.Key{} },
-		Handle: func(_ context.Context, _ *dispatch.Shard, _ *models.Update, ack dispatch.Ack) {
+		Handle: func(_ context.Context, _ *dispatch.Shard, _ *models.Update, _ time.Time, ack dispatch.Ack) {
 			acks <- ack
 		},
 	})
@@ -244,24 +249,37 @@ func TestPollFatalResponses(t *testing.T) {
 
 func TestPollRetryResponses(t *testing.T) {
 	h := newPollHarness(t)
+	var logs bytes.Buffer
+	h.deps.Log = slog.New(slog.NewTextHandler(&logs, nil))
 	h.deps.RetryDelay = 20 * time.Millisecond
-	h.start(t)
+	i := h.start(t)
 	h.webhookOK(t)
 	poll := h.next(t, "getUpdates")
+	const retryMetric = "yabot_ingress_poll_retries_total"
+	assertPollMetric(t, h.metrics, retryMetric, 0)
 	for _, tc := range []struct {
-		status  int
-		body    string
-		minWait time.Duration
+		status      int
+		body        string
+		minWait     time.Duration
+		wantRetries float64
 	}{
 		{
 			http.StatusTooManyRequests,
 			`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`,
 			time.Second,
+			1,
 		},
 		{
 			http.StatusBadGateway,
 			`{"ok":false,"error_code":502,"description":"Bad Gateway"}`,
 			h.deps.RetryDelay,
+			2,
+		},
+		{
+			http.StatusBadRequest,
+			`{"ok":false,"error_code":400,"description":"invalid poll parameters"}`,
+			h.deps.RetryDelay,
+			2,
 		},
 	} {
 		sentAt := time.Now()
@@ -271,10 +289,23 @@ func TestPollRetryResponses(t *testing.T) {
 			t.Errorf("retry after HTTP %d used offset %d after %v, want offset 0 after at least %v",
 				tc.status, poll.offset, elapsed, tc.minWait)
 		}
+		assertPollMetric(t, h.metrics, retryMetric, tc.wantRetries)
+		assertPollMetric(t, h.metrics, "yabot_ingress_delete_webhook_retries_total", 0)
 	}
 	poll.ok(`[{"update_id":40}]`)
 	if got := h.next(t, "getUpdates").offset; got != 41 {
 		t.Fatalf("offset after successful retry = %d, want 41", got)
+	}
+	h.stop(t, i)
+	logText := logs.String()
+	if got := strings.Count(logText, `level=INFO msg="retry Telegram getUpdates"`); got != 2 {
+		t.Errorf("got %d Info retry logs, want 2: %s", got, logText)
+	}
+	if !slices.ContainsFunc(strings.Split(logText, "\n"), func(line string) bool {
+		return strings.Contains(line, `level=ERROR msg="Telegram getUpdates failed"`) &&
+			strings.Contains(line, "invalid poll parameters")
+	}) {
+		t.Errorf("missing Error log for HTTP 400: %s", logText)
 	}
 }
 
@@ -307,13 +338,14 @@ func TestPollWebhookRetryDiagnostics(t *testing.T) {
 		status    int
 		body      string
 		truncated bool
+		level     slog.Level
 		want      []string
 	}{
-		{http.StatusBadRequest, fmt.Sprintf(`{"ok":false,"error_code":400,"description":%q}`, description), false, []string{"error code 400", "webhook refused"}},
-		{http.StatusNotFound, fmt.Sprintf(`{"ok":false,"error_code":404,"description":%q}`, description), false, []string{"error code 404", "webhook refused"}},
-		{http.StatusBadGateway, fmt.Sprintf(`{"ok":false,"error_code":502,"description":%q}`, description), false, []string{"502 webhook refused"}},
-		{http.StatusBadRequest, responseMarker + " " + testBotToken, false, []string{"decode Telegram deleteWebhook response body"}},
-		{http.StatusOK, `{"ok":`, true, []string{"unexpected EOF"}},
+		{http.StatusBadRequest, fmt.Sprintf(`{"ok":false,"error_code":400,"description":%q}`, description), false, slog.LevelError, []string{"error code 400", "webhook refused"}},
+		{http.StatusNotFound, fmt.Sprintf(`{"ok":false,"error_code":404,"description":%q}`, description), false, slog.LevelError, []string{"error code 404", "webhook refused"}},
+		{http.StatusBadGateway, fmt.Sprintf(`{"ok":false,"error_code":502,"description":%q}`, description), false, slog.LevelInfo, []string{"502 webhook refused"}},
+		{http.StatusBadRequest, responseMarker + " " + testBotToken, false, slog.LevelError, []string{"decode Telegram deleteWebhook response body"}},
+		{http.StatusOK, `{"ok":`, true, slog.LevelInfo, []string{"unexpected EOF"}},
 	}
 	for _, tc := range cases {
 		h.next(t, "deleteWebhook").respond(tc.status, tc.body, tc.truncated)
@@ -321,6 +353,8 @@ func TestPollWebhookRetryDiagnostics(t *testing.T) {
 	h.webhookOK(t)
 	h.next(t, "getUpdates")
 	h.stop(t, i)
+	assertPollMetric(t, h.metrics, "yabot_ingress_delete_webhook_retries_total", 2)
+	assertPollMetric(t, h.metrics, "yabot_ingress_poll_retries_total", 0)
 
 	logText := logs.String()
 	for _, sensitive := range []string{testBotToken, encodedToken, responseMarker} {
@@ -333,6 +367,9 @@ func TestPollWebhookRetryDiagnostics(t *testing.T) {
 		t.Fatalf("got %d log lines, want %d: %s", len(lines), len(cases), logText)
 	}
 	for idx, tc := range cases {
+		if !strings.Contains(lines[idx], "level="+tc.level.String()+" ") {
+			t.Errorf("retry after HTTP %d: log %q missing level %v", tc.status, lines[idx], tc.level)
+		}
 		for _, detail := range tc.want {
 			if !strings.Contains(lines[idx], detail) {
 				t.Errorf("retry after HTTP %d: log %q missing %q", tc.status, lines[idx], detail)

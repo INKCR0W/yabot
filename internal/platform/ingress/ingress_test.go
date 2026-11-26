@@ -10,6 +10,7 @@ import (
 	"github.com/INKCR0W/yabot/internal/platform/dispatch"
 	"github.com/INKCR0W/yabot/internal/platform/store"
 	"github.com/INKCR0W/yabot/internal/platform/telegram"
+	"github.com/VictoriaMetrics/metrics"
 	"github.com/go-telegram/bot/models"
 )
 
@@ -81,7 +82,7 @@ func TestBatchSharesSettleDeadline(t *testing.T) {
 				return true
 			},
 			Key: func(*models.Update) dispatch.Key { return dispatch.Key{Space: 1} },
-			Handle: func(_ context.Context, _ *dispatch.Shard, _ *models.Update, ack dispatch.Ack) {
+			Handle: func(_ context.Context, _ *dispatch.Shard, _ *models.Update, _ time.Time, ack dispatch.Ack) {
 				acks <- ack
 			},
 		})
@@ -91,12 +92,18 @@ func TestBatchSharesSettleDeadline(t *testing.T) {
 			requests <- pollRecord{offset: offset, at: time.Now(), deadline: deadline}
 			calls++
 			if calls == 1 {
-				return []models.Update{{ID: 1, Message: &models.Message{}}, {ID: 2, Message: &models.Message{}}}, nil
+				return []models.Update{{ID: 1, Message: &models.Message{Date: 1}}, {ID: 2, Message: &models.Message{}}}, nil
 			}
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}}
-		deps := testDeps(source, router, telegram.NewTimeSkew(nil, nil), fatals)
+		skew := pollSkewFunc(func(time.Time, int64) time.Duration {
+			// Lag measurement uses part of the batch's settle budget.
+			time.Sleep(250 * time.Millisecond)
+			return 0
+		})
+		deps := testDeps(source, router, skew, fatals)
+		deps.Metrics = metrics.NewSet()
 		ingress := startTestIngress(t, deps)
 		first := awaitValue(t, requests)
 		firstAck, secondAck := awaitValue(t, acks), awaitValue(t, acks)
@@ -115,6 +122,89 @@ func TestBatchSharesSettleDeadline(t *testing.T) {
 		select {
 		case fatal := <-fatals:
 			t.Fatalf("received unexpected Fatal: %v", fatal.err)
+		default:
+		}
+	})
+}
+
+func TestPollRoutesBatchReceiveTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		type response struct {
+			offset int64
+			at     time.Time
+		}
+		type delivery struct {
+			id     int64
+			recvAt time.Time
+			at     time.Time
+		}
+		polls := make(chan response, 3)
+		deliveries := make(chan delivery, 4)
+		fatals := make(chan fatalCall, 1)
+		router := newTestRouter(t)
+		retry := errors.New("retry update")
+		failed := false
+		registerRoute(router, "message", dispatch.KindMessage.Mask(), true, func(u *models.Update, ack dispatch.Ack) {
+			if u.ID == 2 && !failed {
+				failed = true
+				ack.Done(retry)
+				return
+			}
+			ack.Done(nil)
+		})
+		observed := observingRouter{Router: router, onAccept: func(u *models.Update, recvAt time.Time) {
+			deliveries <- delivery{id: u.ID, recvAt: recvAt, at: time.Now()}
+		}}
+		calls := 0
+		source := stubSource{poll: func(ctx context.Context, offset int64, _ int, timeout time.Duration, _ []string) ([]models.Update, error) {
+			if timeout == 0 {
+				return nil, nil
+			}
+			calls++
+			if calls > 2 {
+				polls <- response{offset: offset}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			time.Sleep(10 * time.Millisecond)
+			polls <- response{offset: offset, at: time.Now()}
+			return []models.Update{{ID: 1, Message: &models.Message{Date: 1}}, {ID: 2, Message: &models.Message{Date: 1}}}, nil
+		}}
+		skew := pollSkewFunc(func(time.Time, int64) time.Duration {
+			// Advance the fake clock between the response and routing.
+			time.Sleep(time.Millisecond)
+			return 0
+		})
+		deps := testDeps(source, observed, skew, fatals)
+		deps.Metrics = metrics.NewSet()
+		ingress := startTestIngress(t, deps)
+
+		var previous time.Time
+		for _, ids := range [][]int64{{1, 2}, {2}} {
+			poll := awaitValue(t, polls)
+			if poll.offset != 0 || !poll.at.After(previous) {
+				t.Errorf("response at %v with offset %d, want a later response than %v with offset 0", poll.at, poll.offset, previous)
+			}
+			for _, id := range ids {
+				got := awaitValue(t, deliveries)
+				if got.id != id || !got.recvAt.Equal(poll.at) || !got.recvAt.Before(got.at) {
+					t.Errorf("update %d received at %v and routed at %v, want update %d received at %v before routing",
+						got.id, got.recvAt, got.at, id, poll.at)
+				}
+			}
+			previous = poll.at
+		}
+		if got := awaitValue(t, polls).offset; got != 3 {
+			t.Errorf("offset after the retried batch = %d, want 3", got)
+		}
+		if err := ingress.Stop(t.Context()); err != nil {
+			t.Fatalf("stop ingress: %v", err)
+		}
+		select {
+		case got := <-deliveries:
+			t.Errorf("unexpected delivery of update %d", got.id)
+		case fatal := <-fatals:
+			t.Errorf("unexpected Fatal: %v", fatal.err)
 		default:
 		}
 	})
@@ -146,3 +236,13 @@ func (s stubSource) GetUpdates(ctx context.Context, offset int64, limit int, tim
 }
 
 func (stubSource) DeleteWebhook(context.Context) error { return nil }
+
+type observingRouter struct {
+	Router
+	onAccept func(*models.Update, time.Time)
+}
+
+func (r observingRouter) Accept(u *models.Update, recvAt time.Time) dispatch.Receipt {
+	r.onAccept(u, recvAt)
+	return r.Router.Accept(u, recvAt)
+}

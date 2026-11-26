@@ -31,7 +31,7 @@ type Source interface {
 
 type Router interface {
 	// Receipt error text is logged and stored in dead_letter, so it must not carry user data such as bios.
-	Accept(u *models.Update) dispatch.Receipt
+	Accept(u *models.Update, recvAt time.Time) dispatch.Receipt
 	AllowedUpdates() []string
 }
 
@@ -191,7 +191,7 @@ func (i *Ingress) run(ctx context.Context, allowed []string) {
 		if len(updates) == 0 {
 			continue
 		}
-		ok, err := i.settleBatch(ctx, state, updates, received.Add(i.deps.SettleTimeout))
+		ok, err := i.settleBatch(ctx, state, updates, received)
 		if i.metrics.settleSeconds != nil {
 			i.metrics.settleSeconds.Update(time.Since(received).Seconds())
 		}
@@ -229,10 +229,15 @@ func (i *Ingress) deleteWebhook(ctx context.Context) bool {
 			return false
 		}
 		delay := i.deps.RetryDelay
+		level := slog.LevelError
 		if outcome.Class == telegram.Retry {
 			delay = max(delay, outcome.RetryAfter)
+			if i.metrics.webhookRetries != nil {
+				i.metrics.webhookRetries.Inc()
+			}
+			level = slog.LevelInfo
 		}
-		i.deps.Log.WarnContext(ctx, "retry deleting Telegram webhook", "class", outcome.Class, "retry_delay", delay, "error", err)
+		i.deps.Log.Log(ctx, level, "retry deleting Telegram webhook", "class", outcome.Class, "retry_delay", delay, "error", err)
 		waitRetry(ctx, delay)
 	}
 	return false
@@ -242,7 +247,10 @@ func (i *Ingress) logPollError(ctx context.Context, err error, outcome telegram.
 	delay := i.deps.RetryDelay
 	if outcome.Class == telegram.Retry {
 		delay = max(delay, outcome.RetryAfter)
-		i.deps.Log.WarnContext(ctx, "retry Telegram getUpdates", "retry_delay", delay, "error", err)
+		if i.metrics.pollRetries != nil {
+			i.metrics.pollRetries.Inc()
+		}
+		i.deps.Log.InfoContext(ctx, "retry Telegram getUpdates", "retry_delay", delay, "error", err)
 	} else {
 		i.deps.Log.ErrorContext(ctx, "Telegram getUpdates failed", "class", outcome.Class, "error", err)
 	}

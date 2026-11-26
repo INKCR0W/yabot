@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/go-telegram/bot/models"
@@ -23,7 +24,7 @@ type Route struct {
 	// Handle runs on the owning shard and must treat u and all its nested data as read-only.
 	// Critical handlers must call ack.Done once. The Ack for a noncritical route ignores all calls.
 	// Wrap completion callbacks that settle a critical Ack with SettleOnPanic.
-	Handle func(ctx context.Context, sh *Shard, u *models.Update, ack Ack)
+	Handle func(ctx context.Context, sh *Shard, u *models.Update, recvAt time.Time, ack Ack)
 }
 
 // RouterDeps configures Router-specific logging and metrics.
@@ -114,7 +115,7 @@ func (r *Router) freeze() {
 	r.mu.Unlock()
 }
 
-// AllowedUpdates returns a non-nil slice so GetUpdates sends [] when there are no routes.
+// AllowedUpdates returns a non-nil slice for explicit inclusion in getUpdates requests.
 func (r *Router) AllowedUpdates() []string {
 	r.freeze()
 	allowed := make([]string, 0)
@@ -126,9 +127,9 @@ func (r *Router) AllowedUpdates() []string {
 	return allowed
 }
 
-// Accept forwards u without copying or waiting for handlers. The caller must not mutate or
-// reuse u or its nested data from this call onward, even after the receipt settles.
-func (r *Router) Accept(u *models.Update) Receipt {
+// Accept forwards u and recvAt unchanged without waiting for handlers. The caller must not
+// mutate or reuse u or its nested data from this call onward, even after the receipt settles.
+func (r *Router) Accept(u *models.Update, recvAt time.Time) Receipt {
 	r.freeze()
 	var state *receiptState
 	routed := false
@@ -151,7 +152,7 @@ func (r *Router) Accept(u *models.Update) Receipt {
 				rt.deliveryFailed(ack, panicErr)
 				continue
 			}
-			r.submit(rt, key, u, ack)
+			r.submit(rt, key, u, recvAt, ack)
 		}
 	}
 	if !routed && r.unrouted != nil {
@@ -177,7 +178,7 @@ func (rt *registeredRoute) keyFor(u *models.Update) (key Key, matched bool, err 
 	return
 }
 
-func (r *Router) submit(rt *registeredRoute, key Key, u *models.Update, ack *routeAck) {
+func (r *Router) submit(rt *registeredRoute, key Key, u *models.Update, recvAt time.Time, ack *routeAck) {
 	var handlerAck Ack = discardAck{}
 	var onPanic func(error)
 	if ack != nil {
@@ -185,7 +186,7 @@ func (r *Router) submit(rt *registeredRoute, key Key, u *models.Update, ack *rou
 		onPanic = func(err error) { ack.complete(err) }
 	}
 	task := func(ctx context.Context, sh *Shard) {
-		rt.Handle(ctx, sh, u, handlerAck)
+		rt.Handle(ctx, sh, u, recvAt, handlerAck)
 	}
 	if err := r.d.submit(key, rt.Name, task, onPanic); err != nil {
 		rt.deliveryFailed(ack, err)

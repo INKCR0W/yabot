@@ -245,7 +245,7 @@ func registerRoute(r *dispatch.Router, name string, kinds dispatch.KindMask, cri
 		Kinds:    kinds,
 		Critical: critical,
 		Key:      func(*models.Update) dispatch.Key { return dispatch.Key{Space: 1} },
-		Handle: func(_ context.Context, _ *dispatch.Shard, u *models.Update, ack dispatch.Ack) {
+		Handle: func(_ context.Context, _ *dispatch.Shard, u *models.Update, _ time.Time, ack dispatch.Ack) {
 			handle(u, ack)
 		},
 	})

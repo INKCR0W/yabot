@@ -43,7 +43,7 @@ func TestRouterFanOut(t *testing.T) {
 				handled := make(chan string, 4)
 				firstDone := make(chan struct{})
 				for _, name := range []string{"first", "ignored", "optional", "second"} {
-					rt := routerTestRoute(name, name != "optional", func(_ context.Context, _ *Shard, got *models.Update, ack Ack) {
+					rt := routerTestRoute(name, name != "optional", func(_ context.Context, _ *Shard, got *models.Update, _ time.Time, ack Ack) {
 						if got != u {
 							t.Errorf("%s got update %p, want original %p", name, got, u)
 						}
@@ -73,7 +73,7 @@ func TestRouterFanOut(t *testing.T) {
 					}
 					r.Register(rt)
 				}
-				rc := r.Accept(u)
+				rc := r.Accept(u, time.Time{})
 				waitForShardTask(t, d)
 				close(handled)
 				var order []string
@@ -115,6 +115,56 @@ func TestRouterFanOut(t *testing.T) {
 	}
 }
 
+func TestRouterForwardsReceiveTime(t *testing.T) {
+	recvAt := time.Now()
+	if recvAt == recvAt.Round(0) {
+		t.Fatal("test receive time is missing its monotonic reading")
+	}
+	for _, tc := range []struct {
+		name   string
+		recvAt time.Time
+	}{
+		{name: "monotonic", recvAt: recvAt},
+		{name: "zero"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := startTestDispatcher(t, testDeps())
+			r := NewRouter(d, RouterDeps{})
+			routes := []struct {
+				name     string
+				critical bool
+			}{
+				{name: "critical", critical: true},
+				{name: "noncritical"},
+			}
+			delivered := make(map[string]time.Time, len(routes))
+			for _, route := range routes {
+				r.Register(routerTestRoute(route.name, route.critical, func(_ context.Context, _ *Shard, _ *models.Update, got time.Time, ack Ack) {
+					delivered[route.name] = got
+					ack.Done(nil)
+				}))
+			}
+			rc := r.Accept(&models.Update{ID: 42, Message: &models.Message{}}, tc.recvAt)
+			waitForShardTask(t, d)
+			if err := rc.Wait(0); err != nil {
+				t.Errorf("Wait = %v, want nil", err)
+			}
+			for _, route := range routes {
+				got, ok := delivered[route.name]
+				if !ok {
+					t.Errorf("%s handler did not run", route.name)
+					continue
+				}
+				if !got.Equal(tc.recvAt) {
+					t.Errorf("%s receive time = %v, want %v", route.name, got, tc.recvAt)
+				} else if got != tc.recvAt {
+					t.Errorf("%s receive time changed representation: got %v, want %v", route.name, got, tc.recvAt)
+				}
+			}
+		})
+	}
+}
+
 func TestRouterFullInbox(t *testing.T) {
 	var logs bytes.Buffer
 	deps := testDeps()
@@ -124,20 +174,20 @@ func TestRouterFullInbox(t *testing.T) {
 	unblock := holdShardForTicketTest(t, d)
 	r := NewRouter(d, RouterDeps{Log: slog.New(slog.NewJSONHandler(&logs, nil)), Metrics: set})
 	ran := make(chan int64, 2)
-	optional := routerTestRoute("optional", false, func(_ context.Context, _ *Shard, u *models.Update, ack Ack) {
+	optional := routerTestRoute("optional", false, func(_ context.Context, _ *Shard, u *models.Update, _ time.Time, ack Ack) {
 		ack.Done(errors.New("optional failure"))
 		ack.Done(nil)
 		ran <- u.ID
 	})
 	r.Register(optional)
-	critical := routerTestRoute("critical", true, func(context.Context, *Shard, *models.Update, Ack) {
+	critical := routerTestRoute("critical", true, func(context.Context, *Shard, *models.Update, time.Time, Ack) {
 		t.Error("rejected critical route ran")
 	})
 	critical.Kinds = KindEditedMessage.Mask()
 	r.Register(critical)
 
 	for _, id := range []int64{1, 2} {
-		rc := r.Accept(&models.Update{ID: id, Message: &models.Message{}})
+		rc := r.Accept(&models.Update{ID: id, Message: &models.Message{}}, time.Time{})
 		if err := rc.Wait(0); err != nil {
 			t.Errorf("noncritical Wait before handlers ran for update %d = %v, want nil", id, err)
 		}
@@ -148,7 +198,7 @@ func TestRouterFullInbox(t *testing.T) {
 	default:
 	}
 	assertDispatchMetric(t, set, `yabot_dispatch_route_dropped_total{route="optional"}`, 1)
-	rc := r.Accept(&models.Update{ID: 3, EditedMessage: &models.Message{}})
+	rc := r.Accept(&models.Update{ID: 3, EditedMessage: &models.Message{}}, time.Time{})
 	err := rc.Wait(0)
 	if err == ErrBusy || !errors.Is(err, ErrBusy) || IsPermanent(err) {
 		t.Errorf("critical Wait with full inbox = %v, want wrapped transient ErrBusy", err)
@@ -178,21 +228,21 @@ func TestRouterClosedDispatcher(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := NewRouter(d, RouterDeps{Log: slog.New(slog.NewJSONHandler(&logs, nil))})
-	r.Register(routerTestRoute("closed", true, func(context.Context, *Shard, *models.Update, Ack) {
+	r.Register(routerTestRoute("closed", true, func(context.Context, *Shard, *models.Update, time.Time, Ack) {
 		t.Error("rejected route ran")
 	}))
-	optional := routerTestRoute("optional", false, func(context.Context, *Shard, *models.Update, Ack) {
+	optional := routerTestRoute("optional", false, func(context.Context, *Shard, *models.Update, time.Time, Ack) {
 		t.Error("rejected noncritical route ran")
 	})
 	optional.Kinds = KindEditedMessage.Mask()
 	r.Register(optional)
-	rc := r.Accept(&models.Update{Message: &models.Message{}})
+	rc := r.Accept(&models.Update{Message: &models.Message{}}, time.Time{})
 	err = rc.Wait(0)
 	if err == ErrClosed || !errors.Is(err, ErrClosed) || IsPermanent(err) {
 		t.Errorf("Wait on closed dispatcher = %v, want wrapped transient ErrClosed", err)
 	}
 	assertRouterErrorRoute(t, err, "closed")
-	rc = r.Accept(&models.Update{ID: 4, EditedMessage: &models.Message{}})
+	rc = r.Accept(&models.Update{ID: 4, EditedMessage: &models.Message{}}, time.Time{})
 	if err := rc.Wait(0); err != nil {
 		t.Errorf("noncritical Wait on closed dispatcher = %v, want nil", err)
 	}
@@ -219,7 +269,7 @@ func TestRouterHandlePanic(t *testing.T) {
 			d := startTestDispatcher(t, deps)
 			r := NewRouter(d, RouterDeps{Log: slog.New(slog.NewJSONHandler(&routerLogs, nil)), Metrics: routerMetrics})
 			key := Key{Space: 6, A: 12, B: -5}
-			rt := routerTestRoute("handler", true, func(_ context.Context, _ *Shard, _ *models.Update, ack Ack) {
+			rt := routerTestRoute("handler", true, func(_ context.Context, _ *Shard, _ *models.Update, _ time.Time, ack Ack) {
 				if tc.callsDone {
 					ack.Done(nil)
 				}
@@ -230,7 +280,7 @@ func TestRouterHandlePanic(t *testing.T) {
 			if deps.Metrics != nil {
 				assertDispatchMetric(t, deps.Metrics, `yabot_dispatch_panics_total{route="handler"}`, 0)
 			}
-			rc := r.Accept(&models.Update{ID: 21, Message: &models.Message{}})
+			rc := r.Accept(&models.Update{ID: 21, Message: &models.Message{}}, time.Time{})
 			waitForShardTask(t, d)
 			err := rc.Wait(0)
 			if tc.callsDone {
@@ -272,7 +322,7 @@ func TestRouterPredicatePanic(t *testing.T) {
 			deps.Metrics = metrics.NewSet()
 			d := startTestDispatcher(t, deps)
 			r := NewRouter(d, RouterDeps{Log: slog.New(slog.NewJSONHandler(&routerLogs, nil)), Metrics: routerMetrics})
-			rt := routerTestRoute(tc.hook, tc.critical, func(context.Context, *Shard, *models.Update, Ack) {
+			rt := routerTestRoute(tc.hook, tc.critical, func(context.Context, *Shard, *models.Update, time.Time, Ack) {
 				t.Error("handle ran despite a routing panic")
 			})
 			if tc.hook == "key" {
@@ -286,8 +336,8 @@ func TestRouterPredicatePanic(t *testing.T) {
 			}
 			r.Register(rt)
 			ran := make(chan struct{})
-			r.Register(routerTestRoute("healthy", false, func(context.Context, *Shard, *models.Update, Ack) { close(ran) }))
-			rc := r.Accept(&models.Update{ID: 31, Message: &models.Message{}})
+			r.Register(routerTestRoute("healthy", false, func(context.Context, *Shard, *models.Update, time.Time, Ack) { close(ran) }))
+			rc := r.Accept(&models.Update{ID: 31, Message: &models.Message{}}, time.Time{})
 			err := rc.Wait(0)
 			if tc.critical {
 				var pe *PanicError
@@ -318,10 +368,10 @@ func TestRouterAckFromAnotherGoroutine(t *testing.T) {
 	d := startTestDispatcher(t, testDeps())
 	r := NewRouter(d, RouterDeps{Log: slog.New(slog.NewJSONHandler(&logs, nil)), Metrics: set})
 	acks := make(chan Ack, 1)
-	r.Register(routerTestRoute("async", true, func(_ context.Context, _ *Shard, _ *models.Update, ack Ack) {
+	r.Register(routerTestRoute("async", true, func(_ context.Context, _ *Shard, _ *models.Update, _ time.Time, ack Ack) {
 		acks <- ack
 	}))
-	rc := r.Accept(&models.Update{ID: 51, Message: &models.Message{}})
+	rc := r.Accept(&models.Update{ID: 51, Message: &models.Message{}}, time.Time{})
 	ack := await(t, acks)
 	first := errors.New("async failure")
 	second := errors.New("repeated result")
@@ -352,14 +402,14 @@ func TestRouterDuplicateAckWhileAnotherRouteIsPending(t *testing.T) {
 		d := startTestDispatcher(t, testDeps())
 		r := NewRouter(d, RouterDeps{Log: slog.New(slog.NewJSONHandler(&logs, nil)), Metrics: set})
 		first, second := make(chan Ack, 1), make(chan Ack, 1)
-		r.Register(routerTestRoute("first", true, func(_ context.Context, _ *Shard, _ *models.Update, ack Ack) {
+		r.Register(routerTestRoute("first", true, func(_ context.Context, _ *Shard, _ *models.Update, _ time.Time, ack Ack) {
 			ack.Done(nil)
 			first <- ack
 		}))
-		r.Register(routerTestRoute("second", true, func(_ context.Context, _ *Shard, _ *models.Update, ack Ack) {
+		r.Register(routerTestRoute("second", true, func(_ context.Context, _ *Shard, _ *models.Update, _ time.Time, ack Ack) {
 			second <- ack
 		}))
-		rc := r.Accept(&models.Update{ID: 52, Message: &models.Message{}})
+		rc := r.Accept(&models.Update{ID: 52, Message: &models.Message{}}, time.Time{})
 		firstAck, secondAck := await(t, first), await(t, second)
 		settled := make(chan error, 1)
 		go func() { settled <- rc.Wait(time.Second) }()
@@ -391,14 +441,14 @@ func TestRouterReceiptTimeout(t *testing.T) {
 				d := startTestDispatcher(t, testDeps())
 				r := NewRouter(d, RouterDeps{Log: slog.New(slog.NewJSONHandler(&logs, nil)), Metrics: set})
 				firstErr := errors.New("invalid update")
-				r.Register(routerTestRoute("completed", true, func(_ context.Context, _ *Shard, _ *models.Update, ack Ack) {
+				r.Register(routerTestRoute("completed", true, func(_ context.Context, _ *Shard, _ *models.Update, _ time.Time, ack Ack) {
 					ack.Done(Permanent(firstErr))
 				}))
 				acks := make(chan Ack, 1)
-				r.Register(routerTestRoute("slow", true, func(_ context.Context, _ *Shard, _ *models.Update, ack Ack) {
+				r.Register(routerTestRoute("slow", true, func(_ context.Context, _ *Shard, _ *models.Update, _ time.Time, ack Ack) {
 					acks <- ack
 				}))
-				rc := r.Accept(&models.Update{Message: &models.Message{}})
+				rc := r.Accept(&models.Update{Message: &models.Message{}}, time.Time{})
 				ack := await(t, acks)
 				start := time.Now()
 				timedOut := rc.Wait(timeout)
@@ -442,13 +492,13 @@ func TestRouterReceiptReleasesAcksAfterSettlement(t *testing.T) {
 			d := startTestDispatcher(t, testDeps())
 			r := NewRouter(d, RouterDeps{})
 			acks := make(chan weak.Pointer[routeAck], 1)
-			r.Register(routerTestRoute("route", true, func(_ context.Context, _ *Shard, _ *models.Update, ack Ack) {
+			r.Register(routerTestRoute("route", true, func(_ context.Context, _ *Shard, _ *models.Update, _ time.Time, ack Ack) {
 				if tc.err == nil {
 					ack.Done(nil)
 				}
 				acks <- weak.Make(ack.(*routeAck))
 			}))
-			rc := r.Accept(&models.Update{Message: &models.Message{}})
+			rc := r.Accept(&models.Update{Message: &models.Message{}}, time.Time{})
 			ack := await(t, acks)
 			waitForShardTask(t, d)
 			if err := rc.Wait(0); !errors.Is(err, tc.err) {
@@ -478,7 +528,7 @@ func TestRouterMailboxAck(t *testing.T) {
 				dropReason := errors.New("entity removed")
 				aborted := make(chan error, 1)
 				deferred := make(chan struct{})
-				rt := routerTestRoute("deferred", true, func(_ context.Context, sh *Shard, _ *models.Update, ack Ack) {
+				rt := routerTestRoute("deferred", true, func(_ context.Context, sh *Shard, _ *models.Update, _ time.Time, ack Ack) {
 					sh.Hold(key)
 					if !sh.Defer(key, Item{
 						Name: "deferred",
@@ -499,7 +549,7 @@ func TestRouterMailboxAck(t *testing.T) {
 				})
 				rt.Key = func(*models.Update) Key { return key }
 				r.Register(rt)
-				rc := r.Accept(&models.Update{Message: &models.Message{}})
+				rc := r.Accept(&models.Update{Message: &models.Message{}}, time.Time{})
 				await(t, deferred)
 				settled := make(chan error, 1)
 				go func() { settled <- rc.Wait(time.Second) }()
@@ -560,7 +610,7 @@ func TestRouterAllowedUpdates(t *testing.T) {
 			}
 			r := NewRouter(d, RouterDeps{})
 			for i, kinds := range tc.kinds {
-				rt := routerTestRoute(fmt.Sprintf("route-%d", i), false, func(context.Context, *Shard, *models.Update, Ack) {})
+				rt := routerTestRoute(fmt.Sprintf("route-%d", i), false, func(context.Context, *Shard, *models.Update, time.Time, Ack) {})
 				rt.Kinds = kinds
 				r.Register(rt)
 			}
@@ -585,7 +635,7 @@ func TestRouterRegisterPanics(t *testing.T) {
 		{name: "unknown kind", prepare: func(_ *Router, rt *Route) { rt.Kinds |= KindMask(1) << 63 }},
 		{name: "nil Key", prepare: func(_ *Router, rt *Route) { rt.Key = nil }},
 		{name: "nil Handle", prepare: func(_ *Router, rt *Route) { rt.Handle = nil }},
-		{name: "after Accept", prepare: func(r *Router, _ *Route) { r.Accept(&models.Update{ID: 11}) }},
+		{name: "after Accept", prepare: func(r *Router, _ *Route) { r.Accept(&models.Update{ID: 11}, time.Time{}) }},
 		{name: "after AllowedUpdates", prepare: func(r *Router, _ *Route) { r.AllowedUpdates() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -594,7 +644,7 @@ func TestRouterRegisterPanics(t *testing.T) {
 				t.Fatal(err)
 			}
 			r := NewRouter(d, RouterDeps{})
-			rt := routerTestRoute("route", true, func(context.Context, *Shard, *models.Update, Ack) {})
+			rt := routerTestRoute("route", true, func(context.Context, *Shard, *models.Update, time.Time, Ack) {})
 			tc.prepare(r, &rt)
 			defer func() {
 				if recover() == nil {
@@ -610,18 +660,18 @@ func TestRouterUnroutedUpdate(t *testing.T) {
 	d := startTestDispatcher(t, testDeps())
 	set := metrics.NewSet()
 	r := NewRouter(d, RouterDeps{Metrics: set})
-	r.Register(routerTestRoute("message", true, func(context.Context, *Shard, *models.Update, Ack) {
+	r.Register(routerTestRoute("message", true, func(context.Context, *Shard, *models.Update, time.Time, Ack) {
 		t.Error("message handler ran for an unrouted update")
 	}))
 	for _, u := range []*models.Update{{ID: 13}, {ID: 14, EditedMessage: &models.Message{}}} {
-		if err := r.Accept(u).Wait(0); err != nil {
+		if err := r.Accept(u, time.Time{}).Wait(0); err != nil {
 			t.Errorf("Wait for unrouted update %d = %v, want nil", u.ID, err)
 		}
 	}
 	assertDispatchMetric(t, set, "yabot_dispatch_unrouted_total", 2)
 }
 
-func routerTestRoute(name string, critical bool, handle func(context.Context, *Shard, *models.Update, Ack)) Route {
+func routerTestRoute(name string, critical bool, handle func(context.Context, *Shard, *models.Update, time.Time, Ack)) Route {
 	return Route{
 		Name:     name,
 		Kinds:    KindMessage.Mask(),
@@ -694,14 +744,14 @@ func TestRouterDeliversEachRouteToItsKeyShard(t *testing.T) {
 	}
 	ran := make(chan delivery, len(keys))
 	for i, k := range keys {
-		rt := routerTestRoute(fmt.Sprintf("route-%d", i), true, func(_ context.Context, sh *Shard, _ *models.Update, ack Ack) {
+		rt := routerTestRoute(fmt.Sprintf("route-%d", i), true, func(_ context.Context, sh *Shard, _ *models.Update, _ time.Time, ack Ack) {
 			ran <- delivery{route: i, shard: sh.Index()}
 			ack.Done(nil)
 		})
 		rt.Key = func(*models.Update) Key { return k }
 		r.Register(rt)
 	}
-	if err := r.Accept(&models.Update{ID: 1, Message: &models.Message{}}).Wait(5 * time.Second); err != nil {
+	if err := r.Accept(&models.Update{ID: 1, Message: &models.Message{}}, time.Time{}).Wait(5 * time.Second); err != nil {
 		t.Fatalf("Wait = %v, want nil", err)
 	}
 	for range keys {
