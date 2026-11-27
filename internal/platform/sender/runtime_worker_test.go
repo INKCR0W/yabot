@@ -102,28 +102,29 @@ func workerRuntimeShutdown(t *testing.T, got Result, attempts int, ambiguous boo
 	}
 }
 
-type workerRetryLog struct {
-	Message string `json:"msg"`
-	Level   string `json:"level"`
-	Method  string `json:"method"`
-	ChatID  int64  `json:"chat_id"`
-	Attempt int    `json:"attempt"`
-	Error   string `json:"error"`
+type workerAttemptLog struct {
+	Message    string         `json:"msg"`
+	Level      string         `json:"level"`
+	Method     string         `json:"method"`
+	ChatID     int64          `json:"chat_id"`
+	Attempt    int            `json:"attempt"`
+	Error      string         `json:"error"`
+	RetryAfter *time.Duration `json:"retry_after"`
 }
 
-func workerRuntimeRetryLogs(t *testing.T, logs io.Reader) []workerRetryLog {
+func workerRuntimeLogs(t *testing.T, logs io.Reader, message string) []workerAttemptLog {
 	t.Helper()
-	var retryLogs []workerRetryLog
+	var records []workerAttemptLog
 	decoder := json.NewDecoder(logs)
 	for {
-		var record workerRetryLog
+		var record workerAttemptLog
 		if err := decoder.Decode(&record); err == io.EOF {
-			return retryLogs
+			return records
 		} else if err != nil {
 			t.Fatalf("decode sender log: %v", err)
 		}
-		if record.Message == "sender request retrying" {
-			retryLogs = append(retryLogs, record)
+		if record.Message == message {
+			records = append(records, record)
 		}
 	}
 }
@@ -142,6 +143,7 @@ func TestRuntimeAttemptOutcomes(t *testing.T) {
 		want      telegram.Outcome
 		ambiguous bool
 		retryLogs int
+		noRetry   bool
 	}{
 		{name: "ok", errors: []error{nil}, want: telegram.Outcome{Class: telegram.OK}},
 		{name: "done", errors: []error{done}, want: telegram.Outcome{Class: telegram.Done, Reason: telegram.RequestMissing}},
@@ -155,11 +157,18 @@ func TestRuntimeAttemptOutcomes(t *testing.T) {
 		{name: "timeout then 429 then success", errors: []error{context.DeadlineExceeded, limit, nil}, want: telegram.Outcome{Class: telegram.OK}, ambiguous: true, retryLogs: 1},
 		{name: "network failure", errors: []error{io.ErrUnexpectedEOF, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF}, want: telegram.Outcome{Class: telegram.Retry}, ambiguous: true, retryLogs: 2},
 		{name: "server failure", errors: []error{serverFailure, serverFailure, serverFailure}, want: telegram.Outcome{Class: telegram.Retry}, ambiguous: true, retryLogs: 2},
+		{name: "no retry ok", errors: []error{nil}, want: telegram.Outcome{Class: telegram.OK}, noRetry: true},
+		{name: "no retry fatal", errors: []error{fatal}, want: telegram.Outcome{Class: telegram.Fatal}, noRetry: true},
+		{name: "no retry network failure", errors: []error{io.ErrUnexpectedEOF}, want: telegram.Outcome{Class: telegram.Retry}, ambiguous: true, noRetry: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				deps := workerRuntimeDeps(t)
 				deps.MaxRetries = 2
+				checkFinalRetry := tc.noRetry && tc.want.Class == telegram.Retry
+				if checkFinalRetry {
+					deps.Metrics = metrics.NewSet()
+				}
 				var logs bytes.Buffer
 				deps.Log = slog.New(slog.NewJSONHandler(&logs, nil))
 				s := workerRuntimeStart(t, deps)
@@ -177,6 +186,7 @@ func TestRuntimeAttemptOutcomes(t *testing.T) {
 					}
 					return tc.errors[attempt]
 				}, func(result Result) { results <- result })
+				r.NoRetry = tc.noRetry
 				workerRuntimeEnqueue(t, s, r)
 				got := workerRuntimeReceive(t, results)
 				if got.Outcome != tc.want || got.Dropped != 0 || got.Attempts != len(tc.errors) || got.Ambiguous != tc.ambiguous || got.Err != tc.errors[len(tc.errors)-1] {
@@ -186,7 +196,16 @@ func TestRuntimeAttemptOutcomes(t *testing.T) {
 					t.Errorf("Do calls = %d, want %d", got, len(tc.errors))
 				}
 				synctest.Wait()
-				retryLogs := workerRuntimeRetryLogs(t, &logs)
+				if len(results) != 0 {
+					t.Error("Done was called more than once")
+				}
+				if tc.want.Class == telegram.Fatal && !strings.Contains(logs.String(), `"level":"ERROR","msg":"sender request failed"`) {
+					t.Errorf("fatal attempt did not log an error: %s", &logs)
+				}
+				if checkFinalRetry {
+					assertRuntimeFinalRetryObserved(t, &logs, deps.Metrics, r, tc.want.RetryAfter)
+				}
+				retryLogs := workerRuntimeLogs(t, &logs, "sender request retrying")
 				if len(retryLogs) != tc.retryLogs {
 					t.Fatalf("got %d retry logs, want %d: %+v", len(retryLogs), tc.retryLogs, retryLogs)
 				}
@@ -267,7 +286,7 @@ func TestRuntimeRetryStopsAtDeadline(t *testing.T) {
 			t.Errorf("at %v got %+v, want the first attempt's result immediately", time.Since(start), got)
 		}
 		synctest.Wait()
-		if retryLogs := workerRuntimeRetryLogs(t, &logs); len(retryLogs) != 0 {
+		if retryLogs := workerRuntimeLogs(t, &logs, "sender request retrying"); len(retryLogs) != 0 {
 			t.Errorf("unexpected retry logs after final attempt: %+v", retryLogs)
 		}
 	})
@@ -523,7 +542,7 @@ func TestRuntimeStopDrainsOnlyHighClasses(t *testing.T) {
 		if err := s.Enqueue(r); !errors.Is(err, ErrClosed) {
 			t.Errorf("Enqueue after Stop = %v, want ErrClosed", err)
 		}
-		if retryLogs := workerRuntimeRetryLogs(t, &logs); len(retryLogs) != 0 {
+		if retryLogs := workerRuntimeLogs(t, &logs, "sender request retrying"); len(retryLogs) != 0 {
 			t.Errorf("unexpected retry logs during shutdown: %+v", retryLogs)
 		}
 	})

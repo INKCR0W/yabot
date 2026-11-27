@@ -899,17 +899,33 @@ func TestSenderGateRuntimePauseExtension(t *testing.T) {
 }
 
 func TestSenderGateRuntimeDeadline429(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		d := gateRuntimeDeps(t)
-		d.MaxRetries = 2
-		s := gateRuntimeStart(t, d)
-		defer gateRuntimeStop(t, s)
-		r, done := gateRuntimeRequest(Deadline, 6, "approveChatJoinRequest", time.Now().Add(time.Second))
-		r.Do = func(context.Context, *bot.Bot) error { return &bot.TooManyRequestsError{RetryAfter: 2} }
-		gateRuntimeEnqueue(t, s, r)
-		synctest.Wait()
-		gateRuntimeExpired(t, done, 1)
-	})
+	for _, tc := range []struct {
+		name       string
+		class      Class
+		method     string
+		remaining  time.Duration
+		retryAfter int
+		noRetry    bool
+	}{
+		{name: "default", class: Deadline, method: "approveChatJoinRequest", remaining: time.Second, retryAfter: 2},
+		{name: "no retry", class: Deadline, method: "approveChatJoinRequest", remaining: time.Second, retryAfter: 2, noRetry: true},
+		{name: "interactive no retry", class: Interactive, method: "leaveChat", remaining: 5 * time.Second, retryAfter: 6, noRetry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				d := gateRuntimeDeps(t)
+				d.MaxRetries = 2
+				s := gateRuntimeStart(t, d)
+				defer gateRuntimeStop(t, s)
+				r, done := gateRuntimeRequest(tc.class, 6, tc.method, time.Now().Add(tc.remaining))
+				r.NoRetry = tc.noRetry
+				r.Do = func(context.Context, *bot.Bot) error { return &bot.TooManyRequestsError{RetryAfter: tc.retryAfter} }
+				gateRuntimeEnqueue(t, s, r)
+				synctest.Wait()
+				gateRuntimeExpired(t, done, 1)
+			})
+		})
+	}
 }
 
 func TestSenderGateRuntimeDeadline429Escalation(t *testing.T) {

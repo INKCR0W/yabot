@@ -79,6 +79,8 @@ type Request struct {
 	Do func(ctx context.Context, b *bot.Bot) error
 	// Done runs on a sender goroutine and must not block.
 	Done func(Result)
+	// NoRetry limits Do to one attempt. Rate-limit recording, expiry, and shutdown still apply.
+	NoRetry bool
 }
 
 type Result struct {

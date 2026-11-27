@@ -136,7 +136,7 @@ func (s *Sender) finishAttempt(run *call, outcome telegram.Outcome, err error) {
 		result = drop(result, Shutdown)
 	case expiresDuringPause:
 		result = drop(result, Expired)
-	case outcome.Class == telegram.Retry && result.Attempts <= s.deps.MaxRetries:
+	case !r.NoRetry && outcome.Class == telegram.Retry && result.Attempts <= s.deps.MaxRetries:
 		complete = !s.retry(entry, now, rateLimited)
 	}
 	s.mu.Unlock()
@@ -146,6 +146,8 @@ func (s *Sender) finishAttempt(run *call, outcome telegram.Outcome, err error) {
 		s.deps.Log.Error("sender request failed", "method", r.Method, "chat_id", r.ChatID, "error", err)
 	} else if !complete && outcome.RetryAfter == 0 {
 		s.deps.Log.Info("sender request retrying", "method", r.Method, "chat_id", r.ChatID, "attempt", result.Attempts, "error", err)
+	} else if r.NoRetry && outcome.Class == telegram.Retry && result.Dropped == 0 {
+		s.deps.Log.Info("sender request completed with retryable outcome", "method", r.Method, "chat_id", r.ChatID, "retry_after", outcome.RetryAfter, "error", err)
 	}
 	if complete {
 		s.deliver(completion{entry, result}, now)

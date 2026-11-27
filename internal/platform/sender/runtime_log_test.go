@@ -39,11 +39,13 @@ func TestSenderWorkerLogsOutsideLock(t *testing.T) {
 		name      string
 		err       error
 		panicDone bool
+		noRetry   bool
 		wantLog   string
 	}{
-		{"retry", context.DeadlineExceeded, false, "sender request retrying"},
-		{"fatal", errors.New("unexpected response"), false, "sender request failed"},
-		{"callback panic", nil, true, "sender Done callback panicked"},
+		{"retry", context.DeadlineExceeded, false, false, "sender request retrying"},
+		{"fatal", errors.New("unexpected response"), false, false, "sender request failed"},
+		{"callback panic", nil, true, false, "sender Done callback panicked"},
+		{"no retry", context.DeadlineExceeded, false, true, "sender request completed with retryable outcome"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -60,6 +62,7 @@ func TestSenderWorkerLogsOutsideLock(t *testing.T) {
 						panic("callback failure")
 					}
 				})
+				r.NoRetry = tc.noRetry
 				workerRuntimeEnqueue(t, s, r)
 				s.mu.Lock()
 				_, dispatched := s.dispatch(now)
