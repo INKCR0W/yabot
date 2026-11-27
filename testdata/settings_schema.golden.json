@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "specs": [
+    {
+      "feature": "example",
+      "title": "Example settings",
+      "groups": [
+        {
+          "id": "general",
+          "title": "General"
+        },
+        {
+          "id": "limits",
+          "title": "Limits"
+        }
+      ],
+      "fields": [
+        {
+          "key": "enabled",
+          "type": "bool",
+          "label": "Enabled",
+          "help": "Turn this feature on or off.",
+          "group": "general",
+          "default": true
+        },
+        {
+          "key": "mode",
+          "type": "enum",
+          "label": "Mode",
+          "group": "general",
+          "default": "normal",
+          "options": [
+            {
+              "value": "normal",
+              "label": "Normal"
+            },
+            {
+              "value": "strict",
+              "label": "Strict"
+            }
+          ]
+        },
+        {
+          "key": "timeout",
+          "type": "duration",
+          "label": "Timeout",
+          "group": "limits",
+          "default": 300,
+          "min": 60,
+          "max": 1800,
+          "step": 30,
+          "visible_if": {
+            "all": [
+              {
+                "field": "enabled",
+                "eq": true
+              },
+              {
+                "field": "mode",
+                "in": [
+                  "strict"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "limit",
+          "type": "int",
+          "label": "Limit",
+          "group": "limits",
+          "default": 2,
+          "min": 0,
+          "max": 20,
+          "step": 2
+        }
+      ],
+      "values": {
+        "enabled": true,
+        "limit": 2,
+        "mode": "normal",
+        "timeout": 300
+      },
+      "etag": "\"0\""
+    }
+  ]
+}
