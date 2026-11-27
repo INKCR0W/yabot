@@ -1,0 +1,7 @@
+[welcome]
+title = "欢迎"
+empty = ""
+
+[welcome.notice]
+message = "<b>{name}</b>，欢迎来到{chat}！"
+reminder = "{name}，{name}，请查看通知。"

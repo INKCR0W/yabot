@@ -1,0 +1,7 @@
+[welcome]
+title = "Welcome"
+empty = ""
+
+[welcome.notice]
+message = "Welcome to {chat}, <b>{name}</b>!"
+reminder = "{name}, please check the notice."
