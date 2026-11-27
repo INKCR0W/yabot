@@ -1,10 +1,13 @@
 package sender
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"runtime"
 	"strings"
 	"sync"
@@ -99,6 +102,32 @@ func workerRuntimeShutdown(t *testing.T, got Result, attempts int, ambiguous boo
 	}
 }
 
+type workerRetryLog struct {
+	Message string `json:"msg"`
+	Level   string `json:"level"`
+	Method  string `json:"method"`
+	ChatID  int64  `json:"chat_id"`
+	Attempt int    `json:"attempt"`
+	Error   string `json:"error"`
+}
+
+func workerRuntimeRetryLogs(t *testing.T, logs io.Reader) []workerRetryLog {
+	t.Helper()
+	var retryLogs []workerRetryLog
+	decoder := json.NewDecoder(logs)
+	for {
+		var record workerRetryLog
+		if err := decoder.Decode(&record); err == io.EOF {
+			return retryLogs
+		} else if err != nil {
+			t.Fatalf("decode sender log: %v", err)
+		}
+		if record.Message == "sender request retrying" {
+			retryLogs = append(retryLogs, record)
+		}
+	}
+}
+
 func TestRuntimeAttemptOutcomes(t *testing.T) {
 	done := fmt.Errorf("%w, HIDE_REQUESTER_MISSING", bot.ErrorBadRequest)
 	forbidden := fmt.Errorf("%w, bot was blocked by the user", bot.ErrorForbidden)
@@ -112,6 +141,7 @@ func TestRuntimeAttemptOutcomes(t *testing.T) {
 		errors    []error
 		want      telegram.Outcome
 		ambiguous bool
+		retryLogs int
 	}{
 		{name: "ok", errors: []error{nil}, want: telegram.Outcome{Class: telegram.OK}},
 		{name: "done", errors: []error{done}, want: telegram.Outcome{Class: telegram.Done, Reason: telegram.RequestMissing}},
@@ -121,14 +151,17 @@ func TestRuntimeAttemptOutcomes(t *testing.T) {
 		{name: "fatal", errors: []error{fatal}, want: telegram.Outcome{Class: telegram.Fatal}},
 		{name: "rate limited", errors: []error{limit, limit, limit}, want: telegram.Outcome{Class: telegram.Retry, RetryAfter: time.Second}},
 		{name: "429 then success", errors: []error{limit, nil}, want: telegram.Outcome{Class: telegram.OK}},
-		{name: "timeout then success", errors: []error{context.DeadlineExceeded, nil}, want: telegram.Outcome{Class: telegram.OK}, ambiguous: true},
-		{name: "network failure", errors: []error{io.ErrUnexpectedEOF, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF}, want: telegram.Outcome{Class: telegram.Retry}, ambiguous: true},
-		{name: "server failure", errors: []error{serverFailure, serverFailure, serverFailure}, want: telegram.Outcome{Class: telegram.Retry}, ambiguous: true},
+		{name: "timeout then success", errors: []error{context.DeadlineExceeded, nil}, want: telegram.Outcome{Class: telegram.OK}, ambiguous: true, retryLogs: 1},
+		{name: "timeout then 429 then success", errors: []error{context.DeadlineExceeded, limit, nil}, want: telegram.Outcome{Class: telegram.OK}, ambiguous: true, retryLogs: 1},
+		{name: "network failure", errors: []error{io.ErrUnexpectedEOF, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF}, want: telegram.Outcome{Class: telegram.Retry}, ambiguous: true, retryLogs: 2},
+		{name: "server failure", errors: []error{serverFailure, serverFailure, serverFailure}, want: telegram.Outcome{Class: telegram.Retry}, ambiguous: true, retryLogs: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				deps := workerRuntimeDeps(t)
 				deps.MaxRetries = 2
+				var logs bytes.Buffer
+				deps.Log = slog.New(slog.NewJSONHandler(&logs, nil))
 				s := workerRuntimeStart(t, deps)
 				defer workerRuntimeStop(t, s)
 				results := make(chan Result, 8)
@@ -151,6 +184,17 @@ func TestRuntimeAttemptOutcomes(t *testing.T) {
 				}
 				if got := int(calls.Load()); got != len(tc.errors) {
 					t.Errorf("Do calls = %d, want %d", got, len(tc.errors))
+				}
+				synctest.Wait()
+				retryLogs := workerRuntimeRetryLogs(t, &logs)
+				if len(retryLogs) != tc.retryLogs {
+					t.Fatalf("got %d retry logs, want %d: %+v", len(retryLogs), tc.retryLogs, retryLogs)
+				}
+				for i, record := range retryLogs {
+					if record.Level != "INFO" || record.Method != r.Method || record.ChatID != r.ChatID ||
+						record.Attempt != i+1 || record.Error != tc.errors[i].Error() {
+						t.Errorf("unexpected retry log fields: %+v", record)
+					}
 				}
 			})
 		})
@@ -199,7 +243,10 @@ func TestRuntimeRetryBackoff(t *testing.T) {
 
 func TestRuntimeRetryStopsAtDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, err := New(workerRuntimeDeps(t))
+		deps := workerRuntimeDeps(t)
+		var logs bytes.Buffer
+		deps.Log = slog.New(slog.NewJSONHandler(&logs, nil))
+		s, err := New(deps)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -218,6 +265,10 @@ func TestRuntimeRetryStopsAtDeadline(t *testing.T) {
 		got := workerRuntimeReceive(t, results)
 		if !time.Now().Equal(start) || got.Attempts != 1 || got.Dropped != 0 || got.Outcome.Class != telegram.Retry || !errors.Is(got.Err, context.DeadlineExceeded) {
 			t.Errorf("at %v got %+v, want the first attempt's result immediately", time.Since(start), got)
+		}
+		synctest.Wait()
+		if retryLogs := workerRuntimeRetryLogs(t, &logs); len(retryLogs) != 0 {
+			t.Errorf("unexpected retry logs after final attempt: %+v", retryLogs)
 		}
 	})
 }
@@ -364,6 +415,8 @@ func TestRuntimeStopDrainsOnlyHighClasses(t *testing.T) {
 		deps := workerRuntimeDeps(t)
 		deps.Workers, deps.ReservedDeadline, deps.ReservedDecision = 4, 1, 1
 		deps.CapInteractive, deps.CapBackground = 1, 1
+		var logs bytes.Buffer
+		deps.Log = slog.New(slog.NewJSONHandler(&logs, nil))
 		s := workerRuntimeStart(t, deps)
 		type completion struct {
 			class  Class
@@ -469,6 +522,9 @@ func TestRuntimeStopDrainsOnlyHighClasses(t *testing.T) {
 		}
 		if err := s.Enqueue(r); !errors.Is(err, ErrClosed) {
 			t.Errorf("Enqueue after Stop = %v, want ErrClosed", err)
+		}
+		if retryLogs := workerRuntimeRetryLogs(t, &logs); len(retryLogs) != 0 {
+			t.Errorf("unexpected retry logs during shutdown: %+v", retryLogs)
 		}
 	})
 }

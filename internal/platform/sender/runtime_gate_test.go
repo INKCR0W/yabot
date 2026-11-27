@@ -367,7 +367,7 @@ func TestSenderGateRuntimePrediction(t *testing.T) {
 			r, done := gateRuntimeRequest(Deadline, 4, method, now.Add(tc.delay))
 			synctest.Wait()
 			s.mu.Lock()
-			loops, tokens := s.loops, s.global
+			loops, tokens, depth := s.loops, s.global, s.queue.depth(Deadline)
 			s.mu.Unlock()
 			for range 5 {
 				if got := s.WouldMiss(r.Class, r.ChatID, r.Deadline); got != tc.miss {
@@ -376,9 +376,9 @@ func TestSenderGateRuntimePrediction(t *testing.T) {
 			}
 			synctest.Wait()
 			s.mu.Lock()
-			afterLoops, afterTokens := s.loops, s.global
+			afterLoops, afterTokens, afterDepth := s.loops, s.global, s.queue.depth(Deadline)
 			s.mu.Unlock()
-			if afterLoops != loops || afterTokens != tokens || s.ClassWait(Deadline) != 0 {
+			if afterLoops != loops || afterTokens != tokens || afterDepth != depth {
 				t.Fatal("WouldMiss changed sender state")
 			}
 			err := s.Enqueue(r)
@@ -396,13 +396,83 @@ func TestSenderGateRuntimePrediction(t *testing.T) {
 		paused, _ := gateRuntimeRequest(Decision, 8, method, time.Time{})
 		gateRuntimeEnqueue(t, s, paused)
 		synctest.Wait()
-		if got := s.ClassWait(Deadline); got != 15*time.Millisecond {
-			t.Errorf("Deadline class wait = %v, want 15ms", got)
+		if got := s.ClassWait(Deadline); got != 2*time.Second {
+			t.Errorf("Deadline class wait = %v, want 2s", got)
 		}
 		if got := s.ClassWait(Decision); got != 30*time.Millisecond {
 			t.Errorf("Decision class wait = %v, want 30ms", got)
 		}
 	})
+}
+
+func TestSenderRuntimeClassWaitIncludesSharedPauses(t *testing.T) {
+	const joinMethod = "approveChatJoinRequest"
+	type rateLimit struct {
+		method     string
+		chats      []int64
+		retryAfter int
+	}
+	for _, tc := range []struct {
+		name         string
+		limits       []rateLimit
+		backlog      int
+		globalWait   time.Duration
+		deadlineWait time.Duration
+		otherWait    time.Duration
+	}{
+		{"join method pause", []rateLimit{{joinMethod, []int64{1, 2, 3}, 5}}, 0, 0, 4 * time.Second, 0},
+		{"global pause", []rateLimit{{"sendMessage", []int64{1}, 31}}, 0, 30 * time.Second, 30 * time.Second, 30 * time.Second},
+		{"chat only pause", []rateLimit{{joinMethod, []int64{1}, 5}}, 0, 0, 0, 0},
+		{"pause longer than backlog", []rateLimit{{joinMethod, []int64{0}, 5}}, 1, 0, 4 * time.Second, 0},
+		{"backlog longer than pause", []rateLimit{{joinMethod, []int64{0}, 5}}, 6, 0, 6 * time.Second, 0},
+		{"other method pause", []rateLimit{{"getChat", []int64{0}, 3}}, 0, 0, 0, 2 * time.Second},
+		{"join method pause longer than global pause", []rateLimit{
+			{joinMethod, []int64{1, 2, 3}, 6},
+			{"sendMessage", []int64{0}, 2},
+			{"getChat", []int64{0}, 2},
+		}, 0, time.Second, 5 * time.Second, time.Second},
+		{"global pause longer than join method pause", []rateLimit{
+			{joinMethod, []int64{1, 2, 3}, 5},
+			{"sendMessage", []int64{5}, 31},
+		}, 0, 30 * time.Second, 30 * time.Second, 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				deps := gateRuntimeDeps(t)
+				deps.GlobalRPS = 1
+				s := gateRuntimeStart(t, deps)
+				defer gateRuntimeStop(t, s)
+				for _, limit := range tc.limits {
+					for _, chat := range limit.chats {
+						r, done := gateRuntimeRequest(Decision, chat, limit.method, time.Time{})
+						r.Do = func(context.Context, *bot.Bot) error {
+							return &bot.TooManyRequestsError{RetryAfter: limit.retryAfter}
+						}
+						gateRuntimeEnqueue(t, s, r)
+						synctest.Wait()
+						gateRuntimeResult(t, done)
+					}
+				}
+				for range tc.backlog {
+					r, _ := gateRuntimeRequest(Deadline, 4, joinMethod, time.Now().Add(time.Minute))
+					gateRuntimeEnqueue(t, s, r)
+				}
+				time.Sleep(time.Second)
+				synctest.Wait()
+				if tc.globalWait > 0 {
+					requireSenderDegraded(t, s.HealthCheck(), time.Now().Add(tc.globalWait))
+				}
+				if got := s.ClassWait(Deadline); got != tc.deadlineWait {
+					t.Errorf("ClassWait(Deadline) = %v, want %v", got, tc.deadlineWait)
+				}
+				for _, class := range []Class{Decision, Interactive, Background} {
+					if got := s.ClassWait(class); got != tc.otherWait {
+						t.Errorf("ClassWait(%s) = %v, want %v", class, got, tc.otherWait)
+					}
+				}
+			})
+		})
+	}
 }
 
 func TestSenderGateRuntimeExpiredDoneReentry(t *testing.T) {

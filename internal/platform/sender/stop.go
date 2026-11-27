@@ -14,6 +14,7 @@ type stopWaiter struct {
 }
 
 // Stop waits for in-flight calls and their callbacks. A caller can wait again after ctx expires.
+// Do and Done must not call Stop because it would wait for the calling callback itself.
 func (s *Sender) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	switch s.state {

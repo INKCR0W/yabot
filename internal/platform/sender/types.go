@@ -70,10 +70,13 @@ type Request struct {
 	Class Class
 	// ChatID is zero for requests with no associated chat.
 	ChatID int64
+	// Method must be the exact Bot API name (e.g. sendMessage or approveChatJoinRequest).
+	// It determines rate limits and 429 scope, with unlisted methods grouped as other.
 	Method string
 	// Deadline is required for Deadline and Interactive requests. Otherwise zero means no deadline.
 	Deadline time.Time
-	Do       func(ctx context.Context, b *bot.Bot) error
+	// Each invocation of Do sends a single request for Method.
+	Do func(ctx context.Context, b *bot.Bot) error
 	// Done runs on a sender goroutine and must not block.
 	Done func(Result)
 }

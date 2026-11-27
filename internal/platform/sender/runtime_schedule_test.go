@@ -308,6 +308,54 @@ func TestSenderRuntimeOnlyScansNewOrExtendedPauseScopes(t *testing.T) {
 	})
 }
 
+func TestSenderRuntimeDoesNotRescanUnchangedMethodPause(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		deps := gateRuntimeDeps(t)
+		deps.Workers = 2
+		s := gateRuntimeStart(t, deps)
+		defer gateRuntimeStop(t, s)
+
+		respond := make(chan struct{})
+		pending, pendingDone := gateRuntimeRequest(Decision, 1, "getChat", time.Time{})
+		pending.Do = func(ctx context.Context, _ *bot.Bot) error {
+			select {
+			case <-respond:
+				return &bot.TooManyRequestsError{RetryAfter: 1}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		gateRuntimeEnqueue(t, s, pending)
+		synctest.Wait()
+		trigger, triggerDone := gateRuntimeRequest(Decision, 0, "getChat", time.Time{})
+		trigger.Do = func(context.Context, *bot.Bot) error { return &bot.TooManyRequestsError{RetryAfter: 2} }
+		gateRuntimeEnqueue(t, s, trigger)
+		synctest.Wait()
+		gateRuntimeResult(t, triggerDone)
+		s.mu.Lock()
+		before := s.fullPauseScans
+		s.mu.Unlock()
+		if before == 0 {
+			t.Fatal("new method pause did not scan all affected queues")
+		}
+
+		close(respond)
+		synctest.Wait()
+		if got := gateRuntimeResult(t, pendingDone); got.Outcome.RetryAfter != time.Second {
+			t.Fatalf("in-flight result = %+v, want 1s RetryAfter", got)
+		}
+		if got := s.EstimateWait(Decision, 2); got != 2*time.Second {
+			t.Errorf("method pause after shorter 429 = %v, want 2s", got)
+		}
+		s.mu.Lock()
+		after := s.fullPauseScans
+		s.mu.Unlock()
+		if after != before {
+			t.Errorf("unchanged method pause triggered %d additional class-wide scans", after-before)
+		}
+	})
+}
+
 func TestSenderRuntimeGlobalOnlyExtensionExpiresQueuedWork(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		deps := gateRuntimeDeps(t)

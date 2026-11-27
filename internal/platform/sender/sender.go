@@ -237,14 +237,20 @@ func predictedMethod(class Class) methodClass {
 	return methodOther
 }
 
-// ClassWait estimates the time to send the queued requests at the class's current rate share.
+// ClassWait returns the longest of the class's backlog estimate, the global pause, and the pause of the
+// method class it is predicted to use: join requests for Deadline, other for the rest. It excludes chat pauses.
 func (s *Sender) ClassWait(class Class) time.Duration {
 	if !class.valid() {
 		return 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.queue.classWait(class, s.deps.GlobalRPS)
+	now := time.Now()
+	estimate := s.queue.classWait(class, s.deps.GlobalRPS)
+	if until, paused := s.gate.blockedUntil(now, 0, predictedMethod(class)); paused {
+		return max(estimate, until.Sub(now))
+	}
+	return estimate
 }
 
 // SetChatWeight applies a temporary weight to the chat's Deadline requests.
