@@ -1,0 +1,11 @@
+[error]
+bad_request = "请求格式无效。"
+unauthorized = "身份验证失败。"
+forbidden = "没有访问权限。"
+bot_not_admin = "机器人必须是群管理员。"
+not_found = "未找到所请求的资源。"
+conflict = "请求与当前状态冲突。"
+rate_limited = "请求过于频繁。"
+busy = "服务器繁忙。"
+invalid = "部分字段无效。"
+internal = "服务器内部错误。"

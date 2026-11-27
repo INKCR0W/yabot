@@ -1,0 +1,11 @@
+[error]
+bad_request = "Invalid request."
+unauthorized = "Authentication failed."
+forbidden = "Access denied."
+bot_not_admin = "The bot must be a chat administrator."
+not_found = "Not found."
+conflict = "The request conflicts with the current state."
+rate_limited = "Too many requests."
+busy = "The server is busy."
+invalid = "Some fields are invalid."
+internal = "Internal server error."
