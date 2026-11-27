@@ -45,7 +45,9 @@ func TestInflightLimitRejectsWithoutConsumingIPToken(t *testing.T) {
 			t.Errorf("inflight = %v, want 2", got)
 		}
 		const peer = "192.0.2.3:1234"
-		busy := h.serve(middlewareRequest(http.MethodGet, "/ready", peer, nil))
+		request := middlewareRequest(http.MethodGet, "/ready", peer, nil)
+		request.Header.Set("Accept-Language", "zh-CN")
+		busy := h.serve(request)
 		assertMiddlewareError(t, busy, http.StatusServiceUnavailable, "busy", "server busy")
 		h.assertCounter(t, `yabot_http_rejected_total{reason="inflight"}`, 1)
 		h.assertCounter(t, `yabot_http_rejected_total{reason="ip_rate"}`, 0)
@@ -117,7 +119,9 @@ func TestIPRateLimitRefillsAndKeepsClientsIndependent(t *testing.T) {
 		{secondPeer, 0, http.StatusNoContent},
 	} {
 		now = now.Add(tc.wait)
-		res := h.serve(middlewareRequest(http.MethodGet, "/ready", tc.peer, nil))
+		req := middlewareRequest(http.MethodGet, "/ready", tc.peer, nil)
+		req.Header.Set("Accept-Language", "zh-CN")
+		res := h.serve(req)
 		if tc.status == http.StatusTooManyRequests {
 			assertMiddlewareError(t, res, tc.status, "rate_limited", "too many requests")
 			if retry := res.Header().Get("Retry-After"); retry != "1" {
@@ -264,6 +268,7 @@ func TestRecoveryAndAccessLogKeepRouteTemplateAndOmitRequestDetails(t *testing.T
 		req := middlewareRequest(http.MethodGet, path+"?token=query-secret", peer, nil)
 		req.Header.Set("Authorization", auth)
 		req.Header.Set("User-Agent", agent)
+		req.Header.Set("Accept-Language", "zh-CN")
 		responses[i] = h.serve(req)
 		assertMiddlewareStatus(t, responses[i], wantStatus[i])
 	}
@@ -311,6 +316,36 @@ func TestRecoveryAndAccessLogKeepRouteTemplateAndOmitRequestDetails(t *testing.T
 		if strings.Contains(h.output.String(), secret) {
 			t.Errorf("logs contain private request value %q", secret)
 		}
+	}
+}
+
+func TestSetErrorMessagesRejectsNilCallback(t *testing.T) {
+	h := newMiddlewareHarness(Deps{})
+	assertLifecyclePanic(t, func() { h.server.SetErrorMessages(nil) })
+}
+
+func TestRecoveryUsesDefaultMessageIfTranslationPanics(t *testing.T) {
+	h := newMiddlewareHarness(Deps{})
+	const privateValue = "private callback failure"
+	h.server.SetErrorMessages(func(*http.Request, string) string { panic(privateValue) })
+	h.server.Handle("GET /panic", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("handler failed")
+	}))
+	const peer = "192.0.2.1:1234"
+	res := h.serve(middlewareRequest(http.MethodGet, "/panic", peer, nil))
+	assertMiddlewareError(t, res, http.StatusInternalServerError, "internal", "internal error")
+	h.assertCounter(t, "yabot_http_panics_total", 2)
+	if strings.Contains(h.output.String(), privateValue) {
+		t.Error("logs contain the panic payload from the error message callback")
+	}
+	var errorsLogged int
+	for _, record := range h.records(t) {
+		if record.Level == "ERROR" {
+			errorsLogged++
+		}
+	}
+	if errorsLogged != 2 {
+		t.Errorf("error logs = %d, want two for the handler and callback panics", errorsLogged)
 	}
 }
 

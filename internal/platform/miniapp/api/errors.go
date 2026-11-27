@@ -55,6 +55,10 @@ func requestLanguage(r *http.Request) string {
 	if identity, ok := IdentityFrom(r.Context()); ok {
 		return i18n.Resolve(identity.Lang)
 	}
+	return requestHeaderLanguage(r)
+}
+
+func requestHeaderLanguage(r *http.Request) string {
 	first, _, _ := strings.Cut(r.Header.Get("Accept-Language"), ",")
 	tag, _, _ := strings.Cut(first, ";")
 	return i18n.Resolve(strings.TrimSpace(tag))

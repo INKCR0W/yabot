@@ -14,6 +14,7 @@ type httpMetrics struct {
 	invalidIP           *metrics.Counter
 	writeErrors         *metrics.Counter
 	forcedCloses        *metrics.Counter
+	abandonedHandlers   *metrics.Counter
 	serverErrors        *metrics.Counter
 }
 
@@ -30,6 +31,7 @@ func newHTTPMetrics(set *metrics.Set) httpMetrics {
 		invalidIP:           set.GetOrCreateCounter(`yabot_http_client_ip_fallback_total{reason="invalid"}`),
 		writeErrors:         set.GetOrCreateCounter("yabot_http_write_errors_total"),
 		forcedCloses:        set.GetOrCreateCounter("yabot_http_forced_closes_total"),
+		abandonedHandlers:   set.GetOrCreateCounter("yabot_http_stop_abandoned_handlers_total"),
 		serverErrors:        set.GetOrCreateCounter("yabot_http_server_errors_total"),
 	}
 }

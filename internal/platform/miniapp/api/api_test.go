@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/INKCR0W/yabot/internal/platform/httpx"
@@ -34,10 +35,14 @@ func testDeps() (Deps, *http.ServeMux, *metrics.Set, *bytes.Buffer) {
 	logs := new(bytes.Buffer)
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	return Deps{
-		Server: mux, BotToken: testBotToken, MaxAge: testMaxAge, UserRPS: 5, UserBurst: 2,
+		Server: testServer{mux}, BotToken: testBotToken, MaxAge: testMaxAge, UserRPS: 5, UserBurst: 2,
 		Catalog: i18n.New(i18n.Deps{Metrics: set, Log: logger}), Metrics: set, Log: logger, Now: testNow,
 	}, mux, set, logs
 }
+
+type testServer struct{ *http.ServeMux }
+
+func (testServer) SetErrorMessages(func(*http.Request, string) string) {}
 
 func mustNewAPI(t *testing.T, d Deps) *API {
 	t.Helper()
@@ -274,5 +279,69 @@ func TestWithHTTPXRecordsRouteAndRequestID(t *testing.T) {
 		if strings.Contains(logs.String(), secret) {
 			t.Error("HTTP logs include sensitive request data")
 		}
+	}
+}
+
+func TestWithHTTPXLocalizesMiddlewareErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, language, identityLanguage string
+		rateLimited, busy, internal      string
+	}{
+		{"Chinese first", "zh-CN;q=0.1,en;q=1", "en", "请求过于频繁。", "服务器繁忙。", "服务器内部错误。"},
+		{"English first", "en-US;q=0.1,zh-CN;q=1", "zh", "Too many requests.", "The server is busy.", "Internal server error."},
+		{"no language header", "", "zh", "Too many requests.", "The server is busy.", "Internal server error."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, set, _ := testDeps()
+			server := httpx.New(httpx.Deps{Metrics: set, Log: d.Log, Now: d.Now, MaxInflight: 1, IPBurst: 1})
+			d.Server = server
+			a := mustNewAPI(t, d)
+			server.Handle("GET /ready", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			a.Mount(testRoutes{{http.MethodGet, "/panic", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				panic("handler failed")
+			})}})
+			request := func(path, peer, authorization string) *httptest.ResponseRecorder {
+				r := makeRequest(http.MethodGet, path, authorization)
+				r.RemoteAddr = peer
+				if tc.language != "" {
+					r.Header.Set("Accept-Language", tc.language)
+				}
+				return serve(server.Handler(), r)
+			}
+
+			t.Run("IP rate limit", func(t *testing.T) {
+				const peer = "192.0.2.1:1234"
+				if w := request("/ready", peer, ""); w.Code != http.StatusNoContent {
+					t.Fatalf("initial request returned %d: %s", w.Code, w.Body)
+				}
+				assertAPIError(t, request("/ready", peer, ""), http.StatusTooManyRequests, "rate_limited", tc.rateLimited)
+			})
+			t.Run("inflight limit", func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					entered, release := make(chan struct{}), make(chan struct{})
+					server.Handle("GET /hold", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						close(entered)
+						<-release
+						w.WriteHeader(http.StatusNoContent)
+					}))
+					finished := make(chan *httptest.ResponseRecorder, 1)
+					go func() { finished <- request("/hold", "192.0.2.2:1234", "") }()
+					defer func() {
+						close(release)
+						if w := <-finished; w.Code != http.StatusNoContent {
+							t.Errorf("held request returned %d: %s", w.Code, w.Body)
+						}
+					}()
+					<-entered
+					assertAPIError(t, request("/ready", "192.0.2.3:1234", ""), http.StatusServiceUnavailable, "busy", tc.busy)
+				})
+			})
+			t.Run("panic", func(t *testing.T) {
+				w := request("/api/v1/panic", "192.0.2.4:1234", validAuthorization(t, 42, tc.identityLanguage))
+				assertAPIError(t, w, http.StatusInternalServerError, "internal", tc.internal)
+			})
+		})
 	}
 }

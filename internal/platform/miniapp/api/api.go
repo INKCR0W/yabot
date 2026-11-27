@@ -20,6 +20,7 @@ const apiPrefix = "/api/v1"
 type Deps struct {
 	Server interface {
 		Handle(pattern string, h http.Handler)
+		SetErrorMessages(func(r *http.Request, code string) string)
 	}
 	BotToken  string
 	MaxAge    time.Duration
@@ -93,6 +94,9 @@ func New(d Deps) (*API, error) {
 		rateLimited:    d.Metrics.GetOrCreateCounter("yabot_miniapp_rate_limited_total"),
 		encodingErrors: d.Metrics.GetOrCreateCounter(`yabot_miniapp_internal_errors_total{reason="encoding"}`),
 	}
+	d.Server.SetErrorMessages(func(r *http.Request, code string) string {
+		return a.errorBody(requestHeaderLanguage(r), code).Message
+	})
 	a.server.Handle(apiPrefix+"/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.Error(w, r, http.StatusNotFound, CodeNotFound)
 	}))

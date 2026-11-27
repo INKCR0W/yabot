@@ -36,23 +36,27 @@ type Deps struct {
 }
 
 type Server struct {
-	deps   Deps
-	mux    *http.ServeMux
-	slots  chan struct{}
-	byIP   *KeyedLimiter[netip.Addr]
-	stats  httpMetrics
-	server *http.Server
+	deps    Deps
+	mux     *http.ServeMux
+	slots   chan struct{}
+	byIP    *KeyedLimiter[netip.Addr]
+	stats   httpMetrics
+	server  *http.Server
+	handler http.Handler
 
 	hasMetrics    bool
 	hasLogger     bool
 	listen        func(context.Context, string, string) (net.Listener, error)
 	shutdownGrace time.Duration
 
-	mu         sync.Mutex
-	addr       net.Addr
-	serveDone  chan struct{}
-	cancelBase context.CancelFunc
-	stopDone   chan struct{}
+	mu             sync.Mutex
+	addr           net.Addr
+	serveDone      chan struct{}
+	cancelBase     context.CancelFunc
+	stopDone       chan struct{}
+	errorMessages  func(*http.Request, string) string
+	activeHandlers int
+	handlersDone   chan struct{}
 }
 
 // New uses the documented HTTP defaults for zero-valued options.
@@ -97,8 +101,9 @@ func New(d Deps) *Server {
 		listen:        listenConfig.Listen,
 		shutdownGrace: 5 * time.Second,
 	}
+	s.handler = s.recoverPanics(withRequestID(s.logAccess(s.limitBody(s.limitInflight(s.limitIP(s.mux))))))
 	s.server = &http.Server{
-		Handler:           s.recoverPanics(withRequestID(s.logAccess(s.limitBody(s.limitInflight(s.limitIP(s.mux)))))),
+		Handler:           http.HandlerFunc(s.serveHTTP),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -135,7 +140,31 @@ func (s *Server) Handle(pattern string, h http.Handler) {
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.server.Handler
+	return s.handler
+}
+
+// SetErrorMessages installs a translation callback that may be called concurrently.
+// A nil callback or a call after a successful Start panics.
+func (s *Server) SetErrorMessages(fn func(r *http.Request, code string) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.addr != nil {
+		panic("cannot set HTTP error messages after the server has started")
+	}
+	if fn == nil {
+		panic("cannot set a nil HTTP error message callback")
+	}
+	s.errorMessages = fn
+}
+
+func (s *Server) errorMessage(r *http.Request, code, fallback string) string {
+	s.mu.Lock()
+	translate := s.errorMessages
+	s.mu.Unlock()
+	if translate == nil {
+		return fallback
+	}
+	return translate(r, code)
 }
 
 // Addr returns nil until Start binds successfully. Callers must treat the address as read-only.
@@ -196,7 +225,8 @@ func (s *Server) serve(listener net.Listener, done chan struct{}) {
 	}
 }
 
-// Stop drains requests for up to five seconds, bounded by ctx, then cancels and closes remaining connections.
+// Stop allows up to five seconds for graceful shutdown, bounded by ctx, then cancels requests and closes remaining server-managed connections.
+// It waits for the listener's handlers to exit within ctx and returns ctx.Err() if any remain when that wait ends.
 func (s *Server) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if s.addr == nil {
@@ -205,17 +235,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	if done := s.stopDone; done != nil {
 		s.mu.Unlock()
-		select {
-		case <-done:
-			return nil
-		default:
-		}
-		select {
-		case <-done:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return s.awaitStop(ctx, done)
 	}
 	done := make(chan struct{})
 	s.stopDone = done
@@ -224,23 +244,98 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(ctx, s.shutdownGrace)
 	defer cancelShutdown()
-	err := s.server.Shutdown(shutdownCtx)
+	shutdownErr := s.server.Shutdown(shutdownCtx)
 	s.cancelBase()
-	if err == nil {
-		<-s.serveDone
-		return nil
-	}
-	if err := s.server.Close(); err != nil {
-		s.recordServerError("HTTP server close failed")
-	}
-	if err == shutdownCtx.Err() {
-		s.stats.forcedCloses.Inc()
-		s.deps.Log.Info("HTTP server force-closed remaining connections", "reason", err)
-	} else {
-		s.recordServerError("HTTP server shutdown failed")
+	if shutdownErr != nil {
+		if err := s.server.Close(); err != nil {
+			s.recordServerError("HTTP server close failed")
+		}
+		if shutdownErr == shutdownCtx.Err() {
+			s.stats.forcedCloses.Inc()
+			s.deps.Log.Info("HTTP server force-closed remaining connections", "reason", shutdownErr)
+		} else {
+			s.recordServerError("HTTP server shutdown failed")
+		}
 	}
 	<-s.serveDone
-	return ctx.Err()
+	if err := s.waitHandlers(ctx); err != nil {
+		return err
+	}
+	if shutdownErr != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// awaitStop lets a repeated Stop wait for the first one and then for handlers it left running.
+func (s *Server) awaitStop(ctx context.Context, stopDone chan struct{}) error {
+	if err := waitClosed(ctx, stopDone); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	handlersDone := s.handlersDone
+	s.mu.Unlock()
+	return waitClosed(ctx, handlersDone)
+}
+
+// waitClosed prefers a closed channel over an expired ctx.
+func waitClosed(ctx context.Context, ch chan struct{}) error {
+	select {
+	case <-ch:
+		return nil
+	default:
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	if s.handlersDone != nil {
+		// A connection can have parsed a request just before it was closed.
+		s.mu.Unlock()
+		panic(http.ErrAbortHandler)
+	}
+	s.activeHandlers++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.activeHandlers--
+		if s.activeHandlers == 0 && s.handlersDone != nil {
+			close(s.handlersDone)
+		}
+	}()
+	s.handler.ServeHTTP(w, r)
+}
+
+func (s *Server) waitHandlers(ctx context.Context) error {
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.handlersDone = done
+	if s.activeHandlers == 0 {
+		close(done)
+	}
+	s.mu.Unlock()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+	}
+	s.mu.Lock()
+	abandoned := s.activeHandlers
+	s.mu.Unlock()
+	if abandoned == 0 {
+		return nil
+	}
+	err := ctx.Err()
+	s.stats.abandonedHandlers.Add(abandoned)
+	s.deps.Log.Error("HTTP server stopped with active handlers", "count", abandoned, "error", err)
+	return err
 }
 
 func (s *Server) recordServerError(message string) {

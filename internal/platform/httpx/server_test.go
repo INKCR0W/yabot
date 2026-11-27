@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -47,6 +48,9 @@ func TestServerStartBindsAndOwnsRequestContext(t *testing.T) {
 		t.Errorf("GET after canceling Start context = %+v, want 204", got)
 	}
 	assertLifecyclePanic(t, func() { s.Handle("GET /late", http.NotFoundHandler()) })
+	assertLifecyclePanic(t, func() {
+		s.SetErrorMessages(func(*http.Request, string) string { return "late translation" })
+	})
 	if err := s.Stop(t.Context()); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -191,57 +195,144 @@ func TestServerStopLetsActiveRequestFinish(t *testing.T) {
 	}
 }
 
-func TestServerStopForcesCloseWhenGraceEnds(t *testing.T) {
+func TestServerStopWaitsForHandlersAfterClosingConnections(t *testing.T) {
+	const serverGrace = 5 * time.Second
+	const retryTimeout = 500 * time.Millisecond
+	type timedResult struct {
+		err error
+		at  time.Time
+	}
 	for _, test := range []struct {
-		name string
-		want error
+		name          string
+		callerTimeout time.Duration
+		want          error
 	}{
-		{name: "server grace"},
-		{name: "caller deadline", want: context.DeadlineExceeded},
+		{name: "handler finishes after server grace", callerTimeout: 10 * time.Second},
+		{name: "caller deadline before server grace", callerTimeout: time.Second, want: context.DeadlineExceeded},
+		{name: "caller deadline after server grace", callerTimeout: 10 * time.Second, want: context.DeadlineExceeded},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s, set := newLifecycleServer(t, "127.0.0.1:0")
-			if test.want == nil {
-				s.shutdownGrace = time.Nanosecond
-			}
-			entered := make(chan struct{})
-			canceled := make(chan error, 1)
-			release := make(chan struct{})
-			t.Cleanup(func() { close(release) })
-			s.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				close(entered)
-				<-r.Context().Done()
-				canceled <- r.Context().Err()
-				<-release
-			}))
-			startLifecycleServer(t, s)
-			client := newLifecycleClient(t)
-			requestDone := make(chan lifecycleResult, 1)
-			go func() { requestDone <- lifecycleGet(client, s, "/") }()
-			ctx, cancel := context.WithTimeout(t.Context(), lifecycleWatchdog)
-			defer cancel()
-			waitLifecycle(t, ctx, entered)
-			stopCtx := ctx
-			if test.want != nil {
-				var stopCancel context.CancelFunc
-				stopCtx, stopCancel = context.WithDeadline(ctx, time.Unix(0, 0))
+			synctest.Test(t, func(t *testing.T) {
+				logs := &middlewareLogBuffer{}
+				s, set := newLifecycleServerWithDeps(t, Deps{
+					Listen: "127.0.0.1:0", Log: slog.New(slog.NewTextHandler(logs, nil)),
+				})
+				client, peer := net.Pipe()
+				defer func() {
+					if err := errors.Join(client.Close(), peer.Close()); err != nil {
+						t.Errorf("close in-memory connection: %v", err)
+					}
+				}()
+				s.listen = func(context.Context, string, string) (net.Listener, error) {
+					return &lifecyclePipeListener{conn: peer, closed: make(chan struct{})}, nil
+				}
+				connDone := make(chan struct{})
+				s.server.ConnState = func(_ net.Conn, state http.ConnState) {
+					if state == http.StateClosed {
+						close(connDone)
+					}
+				}
+				entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				canceled := make(chan timedResult, 1)
+				finish := sync.OnceFunc(func() { close(release) })
+				defer finish()
+				s.Handle("POST /", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+					defer close(finished)
+					close(entered)
+					select {
+					case <-r.Context().Done():
+						canceled <- timedResult{r.Context().Err(), time.Now()}
+					case <-release:
+						return
+					}
+					<-release
+				}))
+				startLifecycleServer(t, s)
+				watchdog, cancelWatchdog := context.WithTimeout(t.Context(), 30*time.Second)
+				defer cancelWatchdog()
+				deadline, _ := watchdog.Deadline()
+				if err := client.SetDeadline(deadline); err != nil {
+					t.Fatalf("set client deadline: %v", err)
+				}
+				// An unread body prevents net/http's background read from detecting the connection close.
+				writeLifecycleRequest(t, client, "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+				waitLifecycle(t, watchdog, entered)
+				defer func() {
+					finish()
+					// Let net/http finish its unread-body teardown before the virtual clock stops.
+					cleanupCtx, cancel := context.WithTimeout(context.Background(), lifecycleWatchdog)
+					defer cancel()
+					waitLifecycle(t, cleanupCtx, connDone)
+				}()
+				startStop := func(ctx context.Context) <-chan timedResult {
+					done := make(chan timedResult, 1)
+					go func() { done <- timedResult{s.Stop(ctx), time.Now()} }()
+					return done
+				}
+				started := time.Now()
+				stopCtx, stopCancel := context.WithTimeout(t.Context(), test.callerTimeout)
 				defer stopCancel()
-			}
-			if err := s.Stop(stopCtx); !errors.Is(err, test.want) {
-				t.Errorf("Stop = %v, want %v", err, test.want)
-			}
-			if err := waitLifecycle(t, ctx, canceled); !errors.Is(err, context.Canceled) {
-				t.Errorf("request cancellation = %v, want context canceled", err)
-			}
-			if got := waitLifecycle(t, ctx, requestDone); got.err == nil || errors.Is(got.err, context.DeadlineExceeded) {
-				t.Errorf("active GET = %+v, want closed connection", got)
-			}
-			if err := s.Stop(stopCtx); err != nil {
-				t.Errorf("second Stop = %v, want nil", err)
-			}
-			if got := set.GetOrCreateCounter("yabot_http_forced_closes_total").Get(); got != 1 {
-				t.Errorf("forced closes = %d, want 1", got)
-			}
+				stopDone := startStop(stopCtx)
+
+				assertLifecycleConnClosed(t, client)
+				grace := min(serverGrace, test.callerTimeout)
+				select {
+				case got := <-canceled:
+					if elapsed := got.at.Sub(started); !errors.Is(got.err, context.Canceled) || elapsed != grace {
+						t.Errorf("request context after %v = %v, want context canceled after %v", elapsed, got.err, grace)
+					}
+				case <-watchdog.Done():
+					t.Fatalf("request context was not canceled after forced close: %v", watchdog.Err())
+				}
+				var wantAbandoned uint64
+				wantElapsed := test.callerTimeout
+				if test.want == nil {
+					wantElapsed = grace
+					synctest.Wait()
+					select {
+					case got := <-stopDone:
+						t.Fatalf("Stop returned before the handler finished: %v", got.err)
+					default:
+					}
+					finish()
+				} else {
+					wantAbandoned = 1
+				}
+				got := waitLifecycle(t, watchdog, stopDone)
+				if elapsed := got.at.Sub(started); !errors.Is(got.err, test.want) || elapsed != wantElapsed {
+					t.Errorf("Stop returned %v after %v, want %v after %v", got.err, elapsed, test.want, wantElapsed)
+				}
+				if test.want == nil {
+					select {
+					case <-finished:
+					default:
+						t.Error("Stop returned before the handler finished")
+					}
+				} else {
+					retryStarted := time.Now()
+					retryCtx, retryCancel := context.WithTimeout(t.Context(), retryTimeout)
+					defer retryCancel()
+					got := waitLifecycle(t, watchdog, startStop(retryCtx))
+					if elapsed := got.at.Sub(retryStarted); !errors.Is(got.err, context.DeadlineExceeded) || elapsed != retryTimeout {
+						t.Errorf("repeated Stop returned %v after %v, want context deadline exceeded after %v", got.err, elapsed, retryTimeout)
+					}
+					finish()
+					waitLifecycle(t, watchdog, finished)
+					synctest.Wait()
+				}
+				if err := s.Stop(stopCtx); err != nil {
+					t.Errorf("Stop after the handler finished = %v, want nil", err)
+				}
+				if got := set.GetOrCreateCounter("yabot_http_forced_closes_total").Get(); got != 1 {
+					t.Errorf("forced closes = %d, want 1", got)
+				}
+				if got := set.GetOrCreateCounter("yabot_http_stop_abandoned_handlers_total").Get(); got != wantAbandoned {
+					t.Errorf("abandoned handlers = %d, want %d", got, wantAbandoned)
+				}
+				if logged := strings.Contains(logs.String(), `level=ERROR msg="HTTP server stopped with active handlers"`); logged != (wantAbandoned != 0) {
+					t.Errorf("unexpected Stop logs: %s", logs.String())
+				}
+			})
 		})
 	}
 }
@@ -372,6 +463,29 @@ type lifecycleCloseSignal struct {
 	once   sync.Once
 }
 
+type lifecyclePipeListener struct {
+	conn   net.Conn
+	closed chan struct{}
+}
+
+func (l *lifecyclePipeListener) Accept() (net.Conn, error) {
+	if conn := l.conn; conn != nil {
+		l.conn = nil
+		return conn, nil
+	}
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *lifecyclePipeListener) Close() error {
+	close(l.closed)
+	return nil
+}
+
+func (l *lifecyclePipeListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+}
+
 func (l *lifecycleCloseSignal) Close() error {
 	err := l.Listener.Close()
 	l.once.Do(func() { close(l.closed) })
@@ -448,8 +562,25 @@ func assertLifecyclePanic(t *testing.T, operation func()) {
 	t.Helper()
 	defer func() {
 		if recover() == nil {
-			t.Error("route registration did not panic")
+			t.Error("operation did not panic")
 		}
 	}()
 	operation()
+}
+
+func TestServerAbortsRequestsAfterHandlerWaitBegins(t *testing.T) {
+	s, _ := newLifecycleServerWithDeps(t, Deps{Listen: "127.0.0.1:0"})
+	var ran bool
+	s.Handle("GET /", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true }))
+	s.handlersDone = make(chan struct{})
+	close(s.handlersDone)
+	defer func() {
+		if got := recover(); got != http.ErrAbortHandler {
+			t.Errorf("late request panic = %v, want http.ErrAbortHandler", got)
+		}
+		if ran || s.activeHandlers != 0 {
+			t.Errorf("late request ran = %t, active handlers = %d; want aborted before counting", ran, s.activeHandlers)
+		}
+	}()
+	s.serveHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 }

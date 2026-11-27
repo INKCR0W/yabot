@@ -64,10 +64,24 @@ func (s *Server) recoverPanics(next http.Handler) http.Handler {
 			}
 			clear(w.Header())
 			w.Header().Set(requestIDHeader, id)
-			WriteError(response, http.StatusInternalServerError, "internal", "internal error")
+			WriteError(response, http.StatusInternalServerError, "internal", s.internalErrorMessage(r, id, response.route))
 		}()
 		next.ServeHTTP(response, r)
 	})
+}
+
+func (s *Server) internalErrorMessage(r *http.Request, requestID, route string) (message string) {
+	const fallback = "internal error"
+	defer func() {
+		if value := recover(); value != nil {
+			s.stats.panics.Inc()
+			s.deps.Log.ErrorContext(r.Context(), "HTTP error message callback panicked",
+				"request_id", requestID, "route", route,
+				"panic", fmt.Sprintf("%T", value), "stack", string(debug.Stack()))
+			message = fallback
+		}
+	}()
+	return s.errorMessage(r, "internal", fallback)
 }
 
 func (s *Server) logAccess(next http.Handler) http.Handler {
@@ -150,7 +164,7 @@ func (s *Server) limitInflight(next http.Handler) http.Handler {
 		case s.slots <- struct{}{}:
 		default:
 			s.stats.inflightRejected.Inc()
-			WriteError(w, http.StatusServiceUnavailable, "busy", "server busy")
+			WriteError(w, http.StatusServiceUnavailable, "busy", s.errorMessage(r, "busy", "server busy"))
 			return
 		}
 		s.stats.inflight.Inc()
@@ -167,7 +181,7 @@ func (s *Server) limitIP(next http.Handler) http.Handler {
 		if !s.byIP.Allow(ipBucket(s.clientIP(r)), s.deps.Now()) {
 			s.stats.ipRejected.Inc()
 			w.Header().Set("Retry-After", "1")
-			WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+			WriteError(w, http.StatusTooManyRequests, "rate_limited", s.errorMessage(r, "rate_limited", "too many requests"))
 			return
 		}
 		next.ServeHTTP(w, r)
