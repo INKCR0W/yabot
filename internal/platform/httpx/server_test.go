@@ -136,6 +136,35 @@ func TestServerStartReportsAddressInUse(t *testing.T) {
 	startLifecycleServer(t, s)
 }
 
+func TestServerImmediateStopReleasesAddress(t *testing.T) {
+	const attempts = 128
+	ctx, cancel := context.WithTimeout(t.Context(), lifecycleWatchdog)
+	defer cancel()
+	for attempt := 1; attempt <= attempts; attempt++ {
+		s, _ := newLifecycleServer(t, "127.0.0.1:0")
+		startLifecycleServer(t, s)
+		stopped := make(chan error, 1)
+		go func() { stopped <- s.Stop(ctx) }()
+		select {
+		case err := <-stopped:
+			if err != nil {
+				t.Fatalf("attempt %d: Stop: %v", attempt, err)
+			}
+		case <-ctx.Done():
+			// Stop may block on a channel that ignores ctx; report instead of hanging the package.
+			t.Fatalf("attempt %d: Stop did not return: %v", attempt, ctx.Err())
+		}
+		address := s.Addr().String()
+		listener, err := net.Listen("tcp4", address)
+		if err != nil {
+			t.Fatalf("attempt %d: rebind %s immediately after Stop: %v", attempt, address, err)
+		}
+		if err := listener.Close(); err != nil {
+			t.Fatalf("attempt %d: close rebound listener: %v", attempt, err)
+		}
+	}
+}
+
 func TestServerStopLetsActiveRequestFinish(t *testing.T) {
 	s, set := newLifecycleServer(t, "127.0.0.1:0")
 	listenerClosed := make(chan struct{})
@@ -379,6 +408,42 @@ func TestServerReportsUnexpectedServeExit(t *testing.T) {
 	}
 }
 
+func TestServerFatalCallbackCanStopSynchronously(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), lifecycleWatchdog)
+	defer cancel()
+	acceptErr := errors.New("unexpected accept failure")
+	type result struct {
+		component string
+		serveErr  error
+		stopErr   error
+	}
+	returned := make(chan result, 1)
+	var s *Server
+	s = New(Deps{
+		Listen:  "127.0.0.1:0",
+		Metrics: metrics.NewSet(),
+		Log:     slog.New(slog.DiscardHandler),
+		Fatal: func(component string, err error) {
+			returned <- result{component, err, s.Stop(ctx)}
+		},
+	})
+	s.listen = func(context.Context, string, string) (net.Listener, error) {
+		return lifecycleAcceptErrorListener{err: acceptErr}, nil
+	}
+	startLifecycleServer(t, s)
+	select {
+	case got := <-returned:
+		if got.component != "http" || !errors.Is(got.serveErr, acceptErr) {
+			t.Errorf("Fatal = (%q, %v), want (http, %v)", got.component, got.serveErr, acceptErr)
+		}
+		if got.stopErr != nil {
+			t.Errorf("Stop from Fatal: %v", got.stopErr)
+		}
+	case <-ctx.Done():
+		t.Fatalf("Fatal callback did not return after calling Stop: %v", ctx.Err())
+	}
+}
+
 func TestServerAbortsFlushedResponseOnPanic(t *testing.T) {
 	s, set := newLifecycleServer(t, "127.0.0.1:0")
 	panicNow := make(chan struct{})
@@ -461,6 +526,22 @@ type lifecycleCloseSignal struct {
 	net.Listener
 	closed chan struct{}
 	once   sync.Once
+}
+
+type lifecycleAcceptErrorListener struct {
+	err error
+}
+
+func (l lifecycleAcceptErrorListener) Accept() (net.Conn, error) {
+	return nil, l.err
+}
+
+func (l lifecycleAcceptErrorListener) Close() error {
+	return nil
+}
+
+func (l lifecycleAcceptErrorListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
 }
 
 type lifecyclePipeListener struct {
