@@ -145,6 +145,11 @@ func (w *eventWork) answer(err error) {
 	}
 }
 
+func (w *eventWork) isPurge() bool {
+	event, ok := w.event.(LeaveFinished)
+	return ok && event.Source == LeavePurge
+}
+
 func (c *Chats) runEvent(ctx context.Context, sh *dispatch.Shard, k dispatch.Key, work *eventWork) {
 	if err := ctx.Err(); err != nil {
 		work.answer(err)
@@ -181,6 +186,10 @@ func (c *Chats) runEvent(ctx context.Context, sh *dispatch.Shard, k dispatch.Key
 	if len(decision.Effects) != 0 {
 		switch effect := decision.Effects[0].(type) {
 		case Persist:
+			if work.isPurge() && entity.state.Record.State == Removed {
+				c.persist(ctx, sh, k, work, entity, decision, now, "expedite_purge", writePurgeAfter(k.A, effect.Record.PurgeAfter))
+				return
+			}
 			c.persist(ctx, sh, k, work, entity, decision, now, "upsert_chat", writeRecord(effect.Record))
 			return
 		case DeleteRecord:
@@ -326,7 +335,7 @@ func (c *Chats) writeFailed(ctx context.Context, sh *dispatch.Shard, k dispatch.
 				c.install(sh, c.local(sh), entity, decision.Next, now)
 				return c.runEffects(ctx, sh, k, entity, work, decision.Effects, 0)
 			}
-			work.answer(err)
+			work.answer(&store.OpError{Err: redactWriteReceiptError(operation, err)})
 			return false
 		}
 	}
@@ -448,7 +457,7 @@ func replyError(reply Reply) error {
 	case ReplyForbidden:
 		return ErrForbidden
 	case ReplyMembershipChanged:
-		return errMembershipChanged
+		return ErrMembershipChanged
 	case ReplyNotLeft:
 		return &telegram.Error{Outcome: reply.Result.Outcome, Err: reply.Result.Err}
 	default:

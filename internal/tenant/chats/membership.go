@@ -1,6 +1,8 @@
 package chats
 
 import (
+	"errors"
+
 	"github.com/go-telegram/bot/models"
 
 	"github.com/INKCR0W/yabot/internal/platform/dispatch"
@@ -238,6 +240,10 @@ func (s *step) setOwner(event OwnerSet) {
 }
 
 func (s *step) leaveFinished(event LeaveFinished) {
+	if event.Source == LeavePurge && errors.Is(event.Result.Err, errPurgeLeaveCanceled) {
+		s.finishPurge(event, false)
+		return
+	}
 	if event.Source == LeaveIdle {
 		if !s.sameMembership(event.Membership) {
 			s.stale = true

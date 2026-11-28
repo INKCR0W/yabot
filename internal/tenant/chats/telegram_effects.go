@@ -196,11 +196,7 @@ func (c *Chats) sendLeave(k dispatch.Key, ticket dispatch.Ticket, effect LeaveCh
 				// There is no Telegram outcome for a request canceled locally.
 				return &telegram.Error{Outcome: telegram.Outcome{Class: telegram.Unknown}, Err: errIdleLeaveCanceled}
 			}
-			left, err := b.LeaveChat(ctx, &bot.LeaveChatParams{ChatID: k.A})
-			if err == nil && !left {
-				return errors.New("leaveChat returned false")
-			}
-			return safeTelegramError(err)
+			return leaveChat(ctx, b, k.A)
 		},
 	}, done, done)
 	if err := c.submitTelegram(request); err != nil {
@@ -211,6 +207,14 @@ func (c *Chats) sendLeave(k dispatch.Key, ticket dispatch.Ticket, effect LeaveCh
 		request.Done(sender.DroppedResult(sender.Busy, err))
 	}
 	return true
+}
+
+func leaveChat(ctx context.Context, b *bot.Bot, chatID int64) error {
+	left, err := b.LeaveChat(ctx, &bot.LeaveChatParams{ChatID: chatID})
+	if err == nil && !left {
+		return errors.New("leaveChat returned false")
+	}
+	return safeTelegramError(err)
 }
 
 func (c *Chats) canExecuteIdleLeave(chatID int64, effect LeaveChat) bool {

@@ -49,6 +49,13 @@ func writeRecord(record Record) store.Op {
 	}
 }
 
+func writePurgeAfter(chatID, deadline int64) store.Op {
+	return func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE chats SET purge_after = ? WHERE chat_id = ?`, deadline, chatID)
+		return err
+	}
+}
+
 func optionalChatValue[T comparable](v T) any {
 	var zero T
 	if v == zero {

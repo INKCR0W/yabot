@@ -28,11 +28,11 @@ import (
 const SpaceChat dispatch.Space = 1
 
 const (
-	ErrBusy      chatError = "chats: capacity exhausted"
-	ErrForbidden chatError = "chats: bot is not in the chat"
+	ErrBusy              chatError = "chats: capacity exhausted"
+	ErrForbidden         chatError = "chats: bot is not in the chat"
+	ErrMembershipChanged chatError = "chats: bot membership changed"
 
-	errMembershipChanged chatError = "chats: bot membership changed"
-	memberRoute                    = "my_chat_member"
+	memberRoute = "my_chat_member"
 )
 
 type chatError string

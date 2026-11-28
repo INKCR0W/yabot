@@ -47,6 +47,7 @@ type referenceChat struct {
 	idleWaiting      bool
 	idleLeaveEpoch   uint64
 	idleLeaveVersion uint64
+	purgeReply       chats.Reply
 	lastProbe        time.Time
 	lastDowngrade    time.Time
 }
@@ -133,6 +134,9 @@ func (m *referenceChat) applyEvent(event chats.Event, now time.Time) ([]string, 
 		return nil, false
 	}
 	if completed, ok := event.(chats.LeaveFinished); ok {
+		if completed.Source == chats.LeavePurge {
+			return m.finishPurge(completed, now)
+		}
 		return m.finishIdleLeave(completed, now)
 	}
 	if clear, ok := event.(chats.ClearFinished); ok {
@@ -380,6 +384,44 @@ func (m *referenceChat) assignStatus(status chats.ChatState, now time.Time) {
 func (m *referenceChat) advanceEpoch() {
 	m.sequence++
 	m.epoch = m.sequence
+}
+
+func (m *referenceChat) finishPurge(event chats.LeaveFinished, now time.Time) ([]string, bool) {
+	class := event.Result.Outcome.Class
+	accepted := slices.Contains([]telegram.Class{telegram.OK, telegram.Done, telegram.Forbidden, telegram.Migrated}, class) &&
+		event.Result.Dropped == 0
+	effects := []string{"reply"}
+	if !accepted {
+		effects = append(effects, "metric")
+	}
+	m.purgeReply = chats.Reply{Operation: chats.ReplyPurge, Status: chats.ReplyOK}
+	if m.status == chats.NoRecord {
+		return effects, false
+	}
+	if !event.Membership.Exists || event.Membership.Epoch != m.epoch {
+		m.purgeReply.Status = chats.ReplyMembershipChanged
+		return effects, true
+	}
+	if m.status == chats.Removed {
+		if m.purgeAfter != now.Unix() {
+			m.purgeAfter = now.Unix()
+			effects = append(effects, "persist")
+		}
+		return effects, false
+	}
+	if !accepted {
+		m.purgeReply.Status = chats.ReplyNotLeft
+		m.purgeReply.Result = event.Result
+		return effects, false
+	}
+	m.assignStatus(chats.Removed, now)
+	m.rights, m.removedAt, m.removedReason = 0, now, chats.RemovedByPurge
+	if class == telegram.Migrated {
+		m.migratedTo = event.Result.Outcome.MigrateTo
+		m.removedReason = chats.RemovedMigrated
+	}
+	m.purgeAfter = now.Unix()
+	return append(effects, "persist"), false
 }
 
 func (m *referenceChat) finishIdleLeave(event chats.LeaveFinished, now time.Time) ([]string, bool) {
@@ -648,6 +690,24 @@ func referenceScenarios() []referenceScenario {
 		return chats.ProbeFinished{Request: m.request, Chat: chats.ProbeChat{Result: lifecycleResult(telegram.Retry)}}
 	}
 	scenarios := []referenceScenario{
+		{"purge matches committed membership", []referenceStep{
+			{0, referencePurge(lifecycleResult(telegram.Retry))},
+			{0, referenceMemberUpdate(1, left, member)},
+			{0, result},
+			{0, referencePurge(sender.DroppedResult(sender.Expired, nil))},
+			{0, referencePurge(lifecycleResult(telegram.Unauthorized))},
+			{0, referenceMemberUpdate(2, member, left)},
+			{0, referencePurge(lifecycleResult(telegram.Retry))},
+			{0, referenceMemberUpdate(3, left, member)},
+			{0, func(m referenceChat, _ time.Time, _ models.ChatType) chats.Event {
+				return chats.LeaveFinished{
+					Source: chats.LeavePurge, Result: lifecycleResult(telegram.OK),
+					Membership: chats.MembershipSnapshot{Exists: true, Epoch: m.epoch - 1},
+				}
+			}},
+			{0, referencePurge(sender.Result{Outcome: telegram.Outcome{Class: telegram.Migrated, MigrateTo: -743}})},
+			{0, referencePurge(lifecycleResult(telegram.Forbidden))},
+		}},
 		{"recordless departure", []referenceStep{
 			{0, unknown},
 			{0, referenceMemberUpdate(1, member, left)},
@@ -749,6 +809,15 @@ func referenceIdleLeave(outcome telegram.Class) referenceEvent {
 	}
 }
 
+func referencePurge(result sender.Result) referenceEvent {
+	return func(m referenceChat, _ time.Time, _ models.ChatType) chats.Event {
+		return chats.LeaveFinished{
+			Source: chats.LeavePurge, Result: result,
+			Membership: chats.MembershipSnapshot{Exists: m.status != chats.NoRecord, Epoch: m.epoch},
+		}
+	}
+}
+
 func referenceMemberUpdate(id int64, old, new chats.Membership) referenceEvent {
 	return func(_ referenceChat, now time.Time, chatType models.ChatType) chats.Event {
 		return chats.MemberUpdate{
@@ -832,6 +901,10 @@ func runReferenceSequence(t *testing.T, chatType models.ChatType, seed uint64, p
 		}
 		for _, effect := range decision.Effects {
 			switch effect := effect.(type) {
+			case chats.Reply:
+				if leave, ok := event.(chats.LeaveFinished); ok && leave.Source == chats.LeavePurge && effect != model.purgeReply {
+					fail("Purge reply = %+v, want %+v", effect, model.purgeReply)
+				}
 			case chats.StartProbe:
 				current, _ = chats.BeginProbe(current, effect, now, 0)
 			case chats.LeaveChat:
