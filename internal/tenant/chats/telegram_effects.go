@@ -215,7 +215,7 @@ func (c *Chats) sendLeave(k dispatch.Key, ticket dispatch.Ticket, effect LeaveCh
 
 func (c *Chats) canExecuteIdleLeave(chatID int64, effect LeaveChat) bool {
 	entry, exists := c.view.lookup(chatID)
-	return exists && entry.snapshot.MemberEpoch == effect.Membership.Epoch && entry.currentFactVersion() == effect.FactVersion &&
+	return exists && entry.snapshot.MemberEpoch == effect.Membership.Epoch && entry.factVersion == effect.FactVersion &&
 		entry.snapshot.State.canLeaveIdle() && !entry.snapshot.EverActive
 }
 

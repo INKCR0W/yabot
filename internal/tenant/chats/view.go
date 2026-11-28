@@ -63,16 +63,9 @@ type ChatRef struct {
 }
 
 type viewEntry struct {
-	snapshot               ChatSnapshot
-	lastProbe              time.Time
-	factVersion            uint64
-	committedOwnerErasures *atomic.Uint64
-	observedOwnerErasures  uint64
-}
-
-// The SQLite writer can commit an erasure even when the published owner is already empty.
-func (e viewEntry) currentFactVersion() uint64 {
-	return e.factVersion + (e.committedOwnerErasures.Load() - e.observedOwnerErasures)
+	snapshot    ChatSnapshot
+	lastProbe   time.Time
+	factVersion uint64
 }
 
 type viewRows map[int64]viewEntry
@@ -167,10 +160,8 @@ func (v *view) publish(entity *chatEntity) {
 				EverActive: record.EverActive, RemovedAt: record.RemovedAt, RemovedReason: record.RemovedReason,
 				MigratedTo: record.MigratedTo, PurgeAfter: record.PurgeAfter, MemberEpoch: s.MemberEpoch, Watermark: record.Watermark,
 			},
-			lastProbe:              s.Probe.LastStarted,
-			factVersion:            s.Version,
-			committedOwnerErasures: &entity.committedOwnerErasures,
-			observedOwnerErasures:  entity.observedOwnerErasures,
+			lastProbe:   s.Probe.LastStarted,
+			factVersion: s.Version,
 		}
 	}
 

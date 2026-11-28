@@ -153,7 +153,6 @@ func (c *Chats) runEvent(ctx context.Context, sh *dispatch.Shard, k dispatch.Key
 	now := c.now()
 	local := c.local(sh)
 	entity := c.entity(sh, local, k.A, now)
-	entity.observeStoredErasures()
 	if trigger, ok := work.event.(ProbeTriggered); ok && trigger.Trigger == ProbePeriodic &&
 		within(now, entity.state.Probe.LastStarted, c.probePeriodic) {
 		return
@@ -426,7 +425,6 @@ func (c *Chats) sendEffect(sh *dispatch.Shard, k dispatch.Key, entity *chatEntit
 	switch effect := effect.(type) {
 	case StartProbe:
 		now := c.now()
-		entity.observeStoredErasures()
 		state, request := BeginProbe(entity.state, effect, now, c.erasure.sequence.Load())
 		c.install(sh, c.local(sh), entity, state, now)
 		c.sendProbe(k, ticket, request, permit)

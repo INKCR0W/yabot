@@ -2,7 +2,6 @@ package chats
 
 import (
 	"container/list"
-	"sync/atomic"
 	"time"
 
 	"github.com/INKCR0W/yabot/internal/platform/dispatch"
@@ -14,17 +13,8 @@ const (
 )
 
 type chatEntity struct {
-	state                  State
-	replay                 *dispatch.Item
-	committedOwnerErasures atomic.Uint64
-	observedOwnerErasures  uint64
-}
-
-// Fold in storage changes between decisions so a pending commit cannot overwrite them.
-func (e *chatEntity) observeStoredErasures() {
-	committed := e.committedOwnerErasures.Load()
-	e.state.Version += committed - e.observedOwnerErasures
-	e.observedOwnerErasures = committed
+	state  State
+	replay *dispatch.Item
 }
 
 type memoryEntry struct {

@@ -213,23 +213,15 @@ func (c *Chats) writeOwnerErasure(ctx context.Context, userID int64, done func(e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	var erased []int64
-	return c.store.Write(func(tx *sql.Tx) (err error) {
-		rows, err := tx.Query(`UPDATE chats SET owner_id = NULL
-			WHERE chat_id IN (SELECT chat_id FROM chats WHERE owner_id = ? LIMIT ?)
-			RETURNING chat_id`, userID, eraseBatchRows)
+	var affected int64
+	return c.store.Write(func(tx *sql.Tx) error {
+		result, err := tx.Exec(`UPDATE chats SET owner_id = NULL
+			WHERE chat_id IN (SELECT chat_id FROM chats WHERE owner_id = ? LIMIT ?)`, userID, eraseBatchRows)
 		if err != nil {
 			return err
 		}
-		defer func() { err = errors.Join(err, rows.Close()) }()
-		for rows.Next() {
-			var chatID int64
-			if err := rows.Scan(&chatID); err != nil {
-				return err
-			}
-			erased = append(erased, chatID)
-		}
-		return rows.Err()
+		affected, err = result.RowsAffected()
+		return err
 	}, func(err error) {
 		returned := false
 		defer func() {
@@ -237,12 +229,7 @@ func (c *Chats) writeOwnerErasure(ctx context.Context, userID int64, done func(e
 				done(errors.New("chat owner erasure callback panicked"))
 			}
 		}()
-		if err == nil && len(erased) != 0 {
-			for _, chatID := range erased {
-				if entry, ok := c.view.lookup(chatID); ok {
-					entry.committedOwnerErasures.Add(1)
-				}
-			}
+		if err == nil && affected > 0 {
 			err = c.writeOwnerErasure(ctx, userID, done)
 			if err == nil {
 				returned = true

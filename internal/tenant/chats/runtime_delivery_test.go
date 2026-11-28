@@ -1020,89 +1020,78 @@ func TestRuntimeIdleLeaveObservesOwnerErasure(t *testing.T) {
 	}
 }
 
-func TestRuntimeIdleLeaveObservesStoredOwnerErasure(t *testing.T) {
+func TestRuntimeIdleLeaveSurvivesOwnerErasureRetry(t *testing.T) {
 	t.Parallel()
-	const queuedID, sentID, waitingID, userID = -100800, -100802, -100804, 71
-	h := newRuntimeHarness(t, runtimeOptions{
-		tickets: 2,
-		beforeStart: func(h *runtimeHarness) {
-			at := h.now().Add(-8 * 24 * time.Hour).Unix()
-			h.exec(`WITH ids(id) AS (VALUES (?), (?), (?))
-				INSERT INTO chats (chat_id, type, title, state, added_at, updated_at, owner_id)
-				SELECT id, 'supergroup', 'Idle chat', 'onboarding', ?, ?, ? FROM ids`, queuedID, sentID, waitingID, at, at, userID)
-		},
-		configure: func(d *Deps) { d.Store = &rejectFirstChatWrite{Store: d.Store, reject: store.ErrBusy} },
-	})
-	ctx, cancel := context.WithTimeout(t.Context(), runtimeWait)
-	defer cancel()
-	if err := h.chats.DeleteUser(ctx, userID); !errors.Is(err, store.ErrBusy) {
-		t.Fatalf("first erasure returned %v, want store.ErrBusy", err)
+	const chatID, userID = -100800, 71
+	for _, tc := range []struct {
+		name            string
+		sentBeforeRetry bool
+	}{
+		{name: "queued at retry"},
+		{name: "successful response held at retry", sentBeforeRetry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newRuntimeHarness(t, runtimeOptions{beforeStart: func(h *runtimeHarness) {
+				at := h.now().Add(-8 * 24 * time.Hour).Unix()
+				h.exec(`INSERT INTO chats (chat_id, type, title, state, added_at, updated_at, owner_id)
+					VALUES (?, 'supergroup', 'Idle chat', 'onboarding', ?, ?, ?)`, chatID, at, at, userID)
+			}})
+			h.exec(`CREATE TRIGGER reject_erasure BEFORE UPDATE OF owner_id ON chats
+				WHEN OLD.owner_id IS NOT NULL AND NEW.owner_id IS NULL
+				BEGIN SELECT RAISE(ABORT, 'forced erasure rollback'); END`)
+			ctx, cancel := context.WithTimeout(t.Context(), runtimeWait)
+			defer cancel()
+			var opErr *store.OpError
+			if err := h.chats.DeleteUser(ctx, userID); !errors.As(err, &opErr) {
+				t.Fatalf("first erasure returned %v, want store.OpError", err)
+			}
+			h.exec(`DROP TRIGGER reject_erasure`)
+			if got := h.snapshot(chatID).OwnerID; got != 0 {
+				t.Fatalf("snapshot owner after first erasure = %d, want 0", got)
+			}
+			if n, err := h.janitor["chats_idle"].run(ctx); n != 1 || err != nil {
+				t.Fatalf("idle maintenance accepted %d chats with error %v", n, err)
+			}
+			h.finishRequest(h.nextRequest("getChat"), `{"type":"supergroup","title":"Idle chat"}`)
+			h.finishRequest(h.nextRequest("getChatMember"), runtimeProbeMember)
+			h.finishRequest(h.nextRequest("getChatAdministrators"), "[]")
+			leave := h.nextRequest("leaveChat")
+			calls := 0
+			upstream := successfulRuntimeLeaveBot(t, &calls)
+			var leaveErr error
+			if tc.sentBeforeRetry {
+				leaveErr = leave.Do(ctx, upstream)
+			}
+			assertStoredOwner(t, h, chatID, userID)
+			if err := h.chats.DeleteUser(ctx, userID); err != nil {
+				t.Fatalf("retry erasure: %v", err)
+			}
+			assertStoredOwner(t, h, chatID, 0)
+			if !tc.sentBeforeRetry {
+				leaveErr = leave.Do(ctx, upstream)
+			}
+			leave.Done(sender.Result{Outcome: telegram.Classify(leaveErr), Err: leaveErr, Attempts: 1})
+			h.settleEffects(chatID)
+			if leaveErr != nil || calls != 1 {
+				t.Errorf("idle leave made %d Telegram calls with error %v, want one successful call", calls, leaveErr)
+			}
+			wantPurgeAfter := h.now().Unix()
+			if got := h.snapshot(chatID); got.State != Removed || got.PurgeAfter != wantPurgeAfter || got.OwnerID != 0 {
+				t.Errorf("snapshot after successful idle leave = %+v, want removed with purge_after %d and no owner", got, wantPurgeAfter)
+			}
+			var state ChatState
+			var purgeAfter int64
+			err := h.store.Read().QueryRowContext(ctx, `SELECT state, COALESCE(purge_after, 0) FROM chats WHERE chat_id = ?`, chatID).
+				Scan(&state, &purgeAfter)
+			if err != nil || state != Removed || purgeAfter != wantPurgeAfter {
+				t.Errorf("stored idle leave state = %q, purge_after = %d, error = %v, want removed and %d", state, purgeAfter, err, wantPurgeAfter)
+			}
+			assertStoredOwner(t, h, chatID, 0)
+			h.assertProbeTicket(0)
+			h.assertNoRequest()
+		})
 	}
-	for _, id := range []int64{queuedID, sentID, waitingID} {
-		if got := h.snapshot(id).OwnerID; got != 0 {
-			t.Fatalf("snapshot owner for %d after first erasure = %d, want 0", id, got)
-		}
-	}
-	submitIdle := func(id int64) {
-		if err := h.dispatcher.Submit(keyOf(id), func(_ context.Context, sh *dispatch.Shard) {
-			h.chats.enqueueInternal(sh, keyOf(id), ProbeTriggered{Trigger: ProbeIdle})
-		}); err != nil {
-			t.Fatalf("submit idle check for %d: %v", id, err)
-		}
-	}
-	finishIdleProbe := func(id int64) sender.Request {
-		h.finishRequest(h.nextRequest("getChat"), `{"type":"supergroup","title":"Idle chat"}`)
-		h.finishRequest(h.nextRequest("getChatMember"), runtimeProbeMember)
-		h.finishRequest(h.nextRequest("getChatAdministrators"), "[]")
-		leave := h.nextRequest("leaveChat")
-		if leave.ChatID != id {
-			t.Fatalf("idle leave targeted %d, want %d", leave.ChatID, id)
-		}
-		return leave
-	}
-	submitIdle(queuedID)
-	queued := finishIdleProbe(queuedID)
-	submitIdle(sentID)
-	sent := finishIdleProbe(sentID)
-	calls := 0
-	upstream := successfulRuntimeLeaveBot(t, &calls)
-	if err := sent.Do(ctx, upstream); err != nil {
-		t.Fatalf("leave before stored erasure: %v", err)
-	}
-	submitIdle(waitingID)
-	h.barrier(waitingID)
-	h.assertNoRequest()
-	h.assertCounter(`yabot_chats_overload_total{source="sender_ticket"}`, 1)
-	if got := storedChatIdentities(t, h, userID); got != 3 {
-		t.Fatalf("stored owners before retry = %d, want 3", got)
-	}
-	if err := h.chats.DeleteUser(ctx, userID); err != nil {
-		t.Fatalf("retry erasure: %v", err)
-	}
-	assertNoStoredChatIdentity(t, h, userID)
-	err := queued.Do(ctx, upstream)
-	queued.Done(sender.Result{Outcome: telegram.Classify(err), Err: err, Attempts: 1})
-	sent.Done(sender.Result{Outcome: telegram.Outcome{Class: telegram.OK}, Attempts: 1})
-	h.settleEffects(sentID)
-	if calls != 1 {
-		t.Errorf("queued leave reached Telegram after stored erasure, total calls = %d", calls)
-	}
-	for _, id := range []int64{queuedID, sentID} {
-		if got := h.snapshot(id); got.State != Onboarding || got.PurgeAfter != 0 {
-			t.Errorf("old idle leave changed chat %d: %+v", id, got)
-		}
-	}
-	h.advance(time.Second)
-	h.tick()
-	fresh := finishIdleProbe(waitingID)
-	err = fresh.Do(ctx, upstream)
-	fresh.Done(sender.Result{Outcome: telegram.Classify(err), Err: err, Attempts: 1})
-	h.settleEffects(waitingID)
-	if got := h.snapshot(waitingID); calls != 2 || err != nil || got.State != Removed {
-		t.Fatalf("fresh idle Probe did not authorize a leave: calls = %d, error = %v, snapshot = %+v", calls, err, got)
-	}
-	h.assertProbeTicket(0)
-	h.assertNoRequest()
 }
 
 func successfulRuntimeLeaveBot(t *testing.T, calls *int) *bot.Bot {
