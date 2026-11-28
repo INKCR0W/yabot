@@ -11,13 +11,14 @@ import (
 
 // BeginProbe consumes a StartProbe effect after any associated commit, once the
 // shard has installed its new state and assigned any new member epoch.
-func BeginProbe(state State, intent StartProbe, now time.Time) (State, ProbeRequest) {
+func BeginProbe(state State, intent StartProbe, now time.Time, erasureSequence uint64) (State, ProbeRequest) {
 	request := ProbeRequest{
-		Trigger:       intent.Trigger,
-		Version:       state.Version,
-		OwnerRevision: state.OwnerRevision,
-		MemberEpoch:   state.MemberEpoch,
-		StartedAt:     now,
+		Trigger:         intent.Trigger,
+		Version:         state.Version,
+		OwnerRevision:   state.OwnerRevision,
+		MemberEpoch:     state.MemberEpoch,
+		ErasureSequence: erasureSequence,
+		StartedAt:       now,
 	}
 	state.Probe.InFlight = request
 	state.Probe.Actions = intent.Actions
@@ -28,7 +29,7 @@ func BeginProbe(state State, intent StartProbe, now time.Time) (State, ProbeRequ
 	return state, request
 }
 
-// AbandonProbe discards a matching request and its attached actions, returning StartProbe for any queued transition.
+// AbandonProbe settles a matching request using the last committed state for onboarding.
 // Install Next and execute Effects in the shard before processing another event.
 func AbandonProbe(state State, request ProbeRequest, now time.Time, policy Policy) Decision {
 	if request.Trigger == "" || state.Probe.InFlight != request {
@@ -36,6 +37,7 @@ func AbandonProbe(state State, request ProbeRequest, now time.Time, policy Polic
 	}
 	s := step{next: state, now: now, policy: policy}
 	s.settleProbe(state.Probe.IdlePending)
+	s.guideAfterProbe(request, state.Probe.Actions)
 	return Decision{Next: s.next, Effects: s.effects}
 }
 
@@ -175,11 +177,11 @@ func (s *step) finishProbe(event ProbeFinished) {
 	if accepted {
 		before := s.next.Record.State
 		s.applyProbeState(event.Member.Membership, resolution)
-		s.next.GuardKnown = false
 		if s.next.Record.State != NoRecord && probeOK(event.Chat.Result) {
 			s.next.Record.Type = event.Chat.Type
 			s.next.Record.Title = event.Chat.Title
 			s.next.JoinByRequest = event.Chat.JoinByRequest
+			s.next.GuardKnown = false
 			// Telegram exposes guard_bot only to chat administrators.
 			if event.Chat.GuardVisible || probeOK(event.Member.Result) && event.Member.Membership.Status == models.ChatMemberTypeAdministrator {
 				s.next.Record.GuardAssigned = event.Chat.GuardAssigned
@@ -221,7 +223,7 @@ func (s *step) applyProbeState(membership Membership, resolution probeResolution
 func (s *step) applyProbeOwner(event ProbeFinished, resolution probeResolution) {
 	request := event.Request
 	ownerUnchanged := request.OwnerRevision == s.next.OwnerRevision && request.MemberEpoch == s.next.MemberEpoch
-	if resolution.state.isPresent() && s.next.Record.State.isPresent() && (s.newEpoch || ownerUnchanged) {
+	if !event.SkipOwner && resolution.state.isPresent() && s.next.Record.State.isPresent() && (s.newEpoch || ownerUnchanged) {
 		s.next.Record.OwnerID = event.Admins.CreatorID
 	}
 }
@@ -230,9 +232,7 @@ func (s *step) completeProbeActions(request ProbeRequest, observed ChatState, ac
 	actions := s.next.Probe.Actions
 	s.settleProbe(idle && !accepted)
 	record := s.next.Record
-	if actions.Onboarding && s.canGuide(request.MemberEpoch, record.AddedBy) {
-		s.sendOnboarding(actions.LanguageCode, record.State != Onboarding)
-	}
+	s.guideAfterProbe(request, actions)
 	if idle && accepted && observed.isPresent() && record.State.canLeaveIdle() && !record.EverActive &&
 		!s.newEpoch && request.MemberEpoch == s.next.MemberEpoch {
 		s.leaveIdleChat(request.MemberEpoch)
@@ -255,63 +255,45 @@ func (state ChatState) canLeaveIdle() bool {
 
 func (s *step) isIdle() bool {
 	record := s.next.Record
-	idleSince := max(record.UpdatedAt, record.AddedAt)
-	return record.State.canLeaveIdle() && !record.EverActive &&
-		s.now.Sub(time.Unix(idleSince, 0)) >= s.policy.IdleLeaveAfter
+	return record.State.isIdle(record.EverActive, max(record.UpdatedAt, record.AddedAt), s.now, s.policy.IdleLeaveAfter)
+}
+
+func (state ChatState) isIdle(everActive bool, idleSince int64, now time.Time, idleAfter time.Duration) bool {
+	return state.canLeaveIdle() && !everActive && now.Sub(time.Unix(idleSince, 0)) >= idleAfter
 }
 
 func (s *step) leaveIdleChat(epoch uint64) {
 	s.effects = append(s.effects, LeaveChat{
-		Source:     LeaveIdle,
-		Membership: MembershipSnapshot{Exists: true, Epoch: epoch},
-		Class:      sender.Background,
-		NoRetry:    true,
+		Source:      LeaveIdle,
+		Membership:  MembershipSnapshot{Exists: true, Epoch: epoch},
+		FactVersion: s.next.Version,
+		Class:       sender.Background,
+		NoRetry:     true,
 	})
 }
 
-func (s *step) canGuide(epoch uint64, receiverID int64) bool {
+func (s *step) guideAfterProbe(request ProbeRequest, actions FollowUp) {
 	record := s.next.Record
-	return !s.newEpoch && epoch == s.next.MemberEpoch && record.State.isPresent() &&
-		record.Type != models.ChatTypeChannel && receiverID != 0 && record.AddedBy == receiverID
-}
-
-func (s *step) sendOnboarding(languageCode string, ephemeral bool) {
-	message := OnboardingMessage{
-		Language:         s.languages(languageCode),
-		MemberEpoch:      s.next.MemberEpoch,
-		Ephemeral:        ephemeral,
-		GuardAssigned:    s.next.Record.GuardAssigned,
-		GuardKnown:       s.next.GuardKnown,
-		JoinByRequest:    s.next.JoinByRequest,
-		NeedsInviteUsers: s.next.Record.State != Active,
-	}
-	if ephemeral {
-		message.ReceiverID = s.next.Record.AddedBy
-	} else {
-		if within(s.now, s.next.LastOnboarding, MessageCooldown) {
-			return
-		}
-		s.next.LastOnboarding = s.now
-	}
-	s.effects = append(s.effects, message)
-}
-
-func (s *step) finishOnboarding(event OnboardingFinished) {
-	s.effects = append(s.effects, Metric{
-		Kind:    OnboardingOutcome,
-		Outcome: event.Result.Outcome,
-		Dropped: event.Result.Dropped,
-		Error:   unexpectedOutcome(event.Result),
-	})
-	if probeOK(event.Result) || event.Result.Dropped == sender.Shutdown {
+	if !record.State.isPresent() || record.Type == models.ChatTypeChannel {
 		return
 	}
-	if !s.sameMembership(MembershipSnapshot{Exists: true, Epoch: event.MemberEpoch}) {
-		s.stale = true
+	if !s.newEpoch && (!actions.Onboarding || request.MemberEpoch != s.next.MemberEpoch) {
 		return
 	}
-	if s.canGuide(event.MemberEpoch, event.ReceiverID) {
-		s.sendOnboarding(event.LanguageCode, false)
+	languageCode := actions.LanguageCode
+	if s.newEpoch {
+		languageCode = ""
+	}
+	s.effects = append(s.effects, s.next.onboardingMessage(s.languages(languageCode)))
+}
+
+func (s State) onboardingMessage(language LanguageCandidates) OnboardingMessage {
+	return OnboardingMessage{
+		Language:         language,
+		GuardAssigned:    s.Record.GuardAssigned,
+		GuardKnown:       s.GuardKnown,
+		JoinByRequest:    s.JoinByRequest,
+		NeedsInviteUsers: s.Record.State != Active,
 	}
 }
 

@@ -1,0 +1,23 @@
+[general]
+title = "通用"
+group = "通用"
+language = "群语言"
+auto = "自动"
+zh_hans = "简体中文"
+en = "英语"
+
+[onboarding]
+intro = "<b>YaBot 已加入群聊。</b>群主可以通过下方按钮打开设置。"
+guard_unknown = "请在群设置中确认负责处理入群申请的机器人。"
+guard_unassigned = "YaBot 尚未被设为本群的入群审核机器人。请在群设置中查看并完成指派。"
+guard_assigned = "YaBot 已被设为本群的入群审核机器人。"
+join_by_request = "直接加入本群需要经过审批。"
+missing_invite = "请授予 YaBot 邀请用户权限，以便处理入群申请。在 Telegram 的选群界面请选择当前群。"
+has_invite = "YaBot 已获得邀请用户权限。"
+
+[downgrade]
+notice = "YaBot 已失去邀请用户权限。恢复权限后才能处理入群申请。在 Telegram 的选群界面请选择当前群。"
+
+[buttons]
+settings = "打开设置"
+grant_invite = "授予邀请用户权限"

@@ -1,0 +1,23 @@
+[general]
+title = "General"
+group = "General"
+language = "Chat language"
+auto = "Automatic"
+zh_hans = "Simplified Chinese"
+en = "English"
+
+[onboarding]
+intro = "<b>YaBot has joined this chat.</b> The chat owner can open settings below."
+guard_unknown = "Check which bot handles join requests in the chat settings."
+guard_unassigned = "YaBot is not assigned as this chat's guard bot. Review the chat settings to assign it."
+guard_assigned = "YaBot is assigned as this chat's guard bot."
+join_by_request = "This chat requires approval to join directly."
+missing_invite = "Grant YaBot the Invite Users permission so it can handle join requests. Select this chat when Telegram asks you to choose a chat."
+has_invite = "YaBot has the Invite Users permission."
+
+[downgrade]
+notice = "YaBot lost the Invite Users permission. Restore it so YaBot can handle join requests. Select this chat when Telegram asks you to choose a chat."
+
+[buttons]
+settings = "Open settings"
+grant_invite = "Grant Invite Users"

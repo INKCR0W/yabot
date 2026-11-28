@@ -35,7 +35,6 @@ func matrixState(status chats.ChatState, now time.Time) chats.State {
 	state.Record.Title = "original title"
 	state.Record.State = status
 	state.Record.OwnerID = 17
-	state.Record.AddedBy = 18
 	state.Record.UpdatedAt = now.Add(-10 * 24 * time.Hour).Unix()
 	state.Record.AddedAt = state.Record.UpdatedAt - 1
 	state.Record.Watermark = watermark
@@ -150,11 +149,11 @@ func TestMemberUpdateStateMatrix(t *testing.T) {
 					t.Fatalf("epoch proposal = %v, epoch = %d, want proposal %v and current epoch %d", decision.NewMemberEpoch, decision.Next.MemberEpoch, joined, before.MemberEpoch)
 				}
 				if joined {
-					if got.OwnerID != 0 || got.AddedBy != 97 || got.AddedAt != now.Unix() ||
+					if got.OwnerID != 0 || got.AddedAt != now.Unix() ||
 						got.RemovedAt != 0 || got.RemovedReason != "" || got.MigratedTo != 0 || got.PurgeAfter != 0 {
 						t.Fatalf("joining failed to set membership provenance and clear previous removal and owner: %+v", got)
 					}
-				} else if got.OwnerID != before.Record.OwnerID || got.AddedBy != before.Record.AddedBy || got.AddedAt != before.Record.AddedAt {
+				} else if got.OwnerID != before.Record.OwnerID || got.AddedAt != before.Record.AddedAt {
 					t.Fatalf("existing member provenance changed: %+v", got)
 				}
 				if tc.state == chats.Removed {
@@ -240,7 +239,7 @@ func TestProbeCompletionStateMatrix(t *testing.T) {
 	}
 	for _, from := range matrixStates() {
 		before := matrixState(from, now)
-		inFlight, request := chats.BeginProbe(before, chats.StartProbe{Trigger: chats.ProbeUnknown}, now.Add(-time.Minute))
+		inFlight, request := chats.BeginProbe(before, chats.StartProbe{Trigger: chats.ProbeUnknown}, now.Add(-time.Minute), 0)
 		chat := chats.ProbeChat{Result: okResult, Type: inFlight.Record.Type, Title: inFlight.Record.Title}
 		if from == chats.NoRecord {
 			chat.Type, chat.Title = models.ChatTypeSupergroup, "discovered title"
@@ -262,7 +261,7 @@ func TestProbeCompletionStateMatrix(t *testing.T) {
 						decision.NewMemberEpoch != joined || got.EverActive != (from == chats.Active || tc.state == chats.Active) {
 						t.Fatalf("incorrect probe transition: %+v", decision)
 					}
-					if joined && (got.AddedBy != 0 || got.RemovedAt != 0 || got.RemovedReason != "" || got.PurgeAfter != 0 || got.MigratedTo != 0) {
+					if joined && (got.RemovedAt != 0 || got.RemovedReason != "" || got.PurgeAfter != 0 || got.MigratedTo != 0) {
 						t.Fatalf("probe recovery retained membership provenance: %+v", got)
 					}
 					if got.Title != chat.Title || got.Type != chat.Type {
@@ -270,6 +269,10 @@ func TestProbeCompletionStateMatrix(t *testing.T) {
 					}
 				}
 				matrixProbeOutcome(t, decision, before, okResult, false)
+				wantGuide := !matrixPresent(from) && matrixPresent(tc.state)
+				if n := len(matrixEffects[chats.OnboardingMessage](decision)); (n == 1) != wantGuide || n > 1 {
+					t.Fatalf("unexpected onboarding messages: %+v", decision.Effects)
+				}
 				wantDowngrade := from == chats.Active && (tc.state == chats.Degraded || tc.state == chats.Onboarding)
 				if n := len(matrixEffects[chats.DowngradeMessage](decision)); (n == 1) != wantDowngrade || n > 1 {
 					t.Fatalf("unexpected downgrade messages: %+v", decision.Effects)
@@ -299,6 +302,7 @@ func TestProbeCompletionStateMatrix(t *testing.T) {
 						matrixProbeRemoval(t, decision, before, tc.removed, tc.result.Outcome.MigrateTo, now, policy)
 					}
 					matrixProbeOutcome(t, decision, before, tc.result, tc.expectsError)
+					lifecycleForbid[chats.OnboardingMessage](t, decision)
 				})
 			}
 		}
@@ -335,7 +339,7 @@ func matrixProbeOutcome(t *testing.T, decision chats.Decision, before chats.Stat
 		t.Fatalf("probe metrics=%+v, want %+v", metrics, want)
 	}
 	if decision.Next.Probe.InFlight.Trigger != "" || decision.Next.Version != before.Version ||
-		len(matrixEffects[chats.StartProbe](decision)) != 0 || len(matrixEffects[chats.OnboardingMessage](decision)) != 0 {
+		len(matrixEffects[chats.StartProbe](decision)) != 0 {
 		t.Fatalf("unexpected follow-up or in-flight marker: %+v", decision)
 	}
 	watermark := before.Record.Watermark
@@ -441,7 +445,7 @@ func TestNonReporterProbeTriggerStateMatrix(t *testing.T) {
 	}
 }
 
-func TestMemberUpdateAdapterFiltersRouteAndMalformedMembership(t *testing.T) {
+func TestMemberUpdateAdapterFiltersRoute(t *testing.T) {
 	for _, chatType := range []models.ChatType{models.ChatTypeGroup, models.ChatTypeSupergroup, models.ChatTypeChannel, models.ChatTypePrivate, "unknown"} {
 		t.Run(string(chatType), func(t *testing.T) {
 			payload := &models.ChatMemberUpdated{Chat: models.Chat{Type: chatType}}
@@ -457,27 +461,33 @@ func TestMemberUpdateAdapterFiltersRouteAndMalformedMembership(t *testing.T) {
 			t.Fatalf("non-standalone my_chat_member payload matched the route: %+v", update)
 		}
 	}
+}
+
+func TestInvalidMemberUpdateLeavesStateAndWatermarkUntouched(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	for _, identity := range []models.ChatMemberType{models.ChatMemberTypeAdministrator, models.ChatMemberTypeRestricted, models.ChatMemberTypeOwner, "unknown"} {
-		t.Run(string(identity), func(t *testing.T) {
-			before := matrixState(chats.Active, now)
-			newOrder := dispatch.Order{Date: now.Unix(), ID: 51}
-			decision := chats.Step(before, chats.MemberUpdate{Order: newOrder, New: chats.MembershipOf(models.ChatMember{Type: identity})}, now, matrixPolicy())
-			matrixPersist(t, decision, true)
-			before.Record.Watermark = newOrder
-			before.Version++
-			metrics := matrixEffects[chats.Metric](decision)
-			if decision.Next != before || len(metrics) != 1 || metrics[0].Kind != chats.InvalidMember || !metrics[0].Error {
-				t.Fatalf("invalid membership should advance the watermark and version and report the error: %+v", decision)
-			}
-		})
+	for _, from := range []chats.ChatState{chats.NoRecord, chats.Onboarding} {
+		for _, identity := range []models.ChatMemberType{models.ChatMemberTypeAdministrator, models.ChatMemberTypeRestricted, models.ChatMemberTypeOwner, "unknown"} {
+			t.Run(fmt.Sprintf("from_%q/%s", from, identity), func(t *testing.T) {
+				before := matrixState(from, now)
+				update := chats.MemberUpdate{
+					Order: dispatch.Order{Date: now.Unix(), ID: 51},
+					Old:   chats.Membership{Status: models.ChatMemberTypeAdministrator},
+					New:   chats.MembershipOf(models.ChatMember{Type: identity}),
+				}
+				decision := chats.Step(before, update, now, matrixPolicy())
+				if decision.Next != before || decision.NewMemberEpoch || decision.Stale || len(decision.Effects) != 1 ||
+					decision.Effects[0] != (chats.Metric{Kind: chats.InvalidMember, Error: true}) {
+					t.Fatalf("invalid membership should only report the error: %+v", decision)
+				}
+			})
+		}
 	}
 }
 
 func TestSuccessfulGetChatMetadataSurvivesLaterProbeFailure(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	before := matrixState(chats.Active, now)
-	inFlight, request := chats.BeginProbe(before, chats.StartProbe{Trigger: chats.ProbeUnknown}, now.Add(-time.Minute))
+	inFlight, request := chats.BeginProbe(before, chats.StartProbe{Trigger: chats.ProbeUnknown}, now.Add(-time.Minute), 0)
 	okResult := sender.Result{Outcome: telegram.Outcome{Class: telegram.OK}}
 	event := chats.ProbeFinished{
 		Request: request,
@@ -529,11 +539,12 @@ func TestLeaveCompletionStateMatrix(t *testing.T) {
 					if source == chats.LeaveRejected {
 						membership = chats.MembershipSnapshot{}
 					}
-					event := chats.LeaveFinished{Source: source, Membership: membership, Result: result}
+					event := chats.LeaveFinished{Source: source, Membership: membership, FactVersion: before.Version, Result: result}
 					decision := chats.Step(before, event, now, policy)
 					want := before
 					purge := source == chats.LeavePurge
-					expedite := source != chats.LeaveRejected && from != chats.NoRecord && (tc.left || purge && from == chats.Removed)
+					staleIdle := source == chats.LeaveIdle && (from == chats.NoRecord || from == chats.Active)
+					expedite := source != chats.LeaveRejected && !staleIdle && from != chats.NoRecord && (tc.left || from == chats.Removed)
 					matrixPersist(t, decision, expedite)
 					if expedite {
 						want.Version++
@@ -552,7 +563,7 @@ func TestLeaveCompletionStateMatrix(t *testing.T) {
 						}
 					}
 					if decision.Next != want || decision.NewMemberEpoch || len(matrixEffects[chats.LeaveChat](decision)) != 0 ||
-						decision.Stale != (from == chats.NoRecord && source == chats.LeaveIdle) {
+						decision.Stale != staleIdle {
 						t.Fatalf("leave completion got %+v, want state %+v and no additional leave", decision, want)
 					}
 					replies := matrixEffects[chats.Reply](decision)
@@ -567,8 +578,12 @@ func TestLeaveCompletionStateMatrix(t *testing.T) {
 					} else if len(replies) != 0 {
 						t.Fatalf("%s leave replied to a caller: %+v", source, replies)
 					}
-					if !tc.left {
-						metrics := matrixEffects[chats.Metric](decision)
+					metrics := matrixEffects[chats.Metric](decision)
+					if staleIdle || source == chats.LeaveIdle && from == chats.Removed {
+						if len(metrics) != 0 {
+							t.Fatalf("idle leave outcome should have been ignored: %+v", metrics)
+						}
+					} else if !tc.left {
 						if len(metrics) != 1 || metrics[0].Kind != chats.LeaveOutcome || metrics[0].Outcome != tc.outcome || metrics[0].Dropped != tc.drop {
 							t.Fatalf("leave failure metric lost outcome: %+v", metrics)
 						}
@@ -576,6 +591,52 @@ func TestLeaveCompletionStateMatrix(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestIdleLeaveCompletionAfterChatFactsChange(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	for _, tc := range []struct {
+		name                              string
+		status                            chats.ChatState
+		everActive, newEpoch, currentFact bool
+		stale                             bool
+		outcome                           telegram.Class
+		expedite                          bool
+	}{
+		{name: "new membership wins over confirmed removal", status: chats.Removed, newEpoch: true, stale: true, outcome: telegram.Retry},
+		{name: "watermark advanced", status: chats.Onboarding, stale: true, outcome: telegram.OK},
+		{name: "promotion committed", status: chats.Active, everActive: true, stale: true, outcome: telegram.OK},
+		{name: "active state is ineligible even without history", status: chats.Active, currentFact: true, stale: true, outcome: telegram.OK},
+		{name: "left after promotion retains data", status: chats.Removed, everActive: true, stale: true, outcome: telegram.OK},
+		{name: "left without promotion expedites despite newer facts", status: chats.Removed, outcome: telegram.Retry, expedite: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := matrixState(tc.status, now)
+			before.Record.EverActive = tc.everActive
+			membership := before.MembershipSnapshot()
+			if tc.newEpoch {
+				membership.Epoch--
+			}
+			fact := before.Version
+			if !tc.currentFact {
+				fact--
+			}
+			decision := chats.Step(before, chats.LeaveFinished{
+				Source: chats.LeaveIdle, Membership: membership, FactVersion: fact,
+				Result: lifecycleResult(tc.outcome),
+			}, now, matrixPolicy())
+			want := before
+			if tc.expedite {
+				want.Record.PurgeAfter = now.Unix()
+				want.Version++
+			}
+			matrixPersist(t, decision, tc.expedite)
+			if decision.Next != want || decision.Stale != tc.stale || decision.NewMemberEpoch ||
+				len(decision.Effects) != len(matrixEffects[chats.Persist](decision)) {
+				t.Fatalf("idle leave got %+v, want state %+v and stale=%t", decision, want, tc.stale)
+			}
+		})
 	}
 }
 

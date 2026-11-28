@@ -13,7 +13,7 @@ func TestAbandonProbeDiscardsTheUncommittedCompletion(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
 	state := lifecycleState(chats.Onboarding)
 	start := chats.Step(state, chats.ProbeTriggered{Trigger: chats.ProbeIdle}, now, policy)
-	state, request := chats.BeginProbe(start.Next, lifecycleRequire[chats.StartProbe](t, start), now)
+	state, request := chats.BeginProbe(start.Next, lifecycleRequire[chats.StartProbe](t, start), now, 0)
 	result := lifecycleProbe(request, models.ChatMemberTypeMember, 0)
 	result.Chat.Title = "uncommitted title"
 	finishedAt := now.Add(time.Second)
@@ -49,7 +49,7 @@ func TestAbandonProbeDiscardsTheUncommittedCompletion(t *testing.T) {
 	if intent != (chats.StartProbe{Trigger: chats.ProbeUnknown}) {
 		t.Fatalf("new Probe inherited abandoned actions: %+v", intent)
 	}
-	state, _ = chats.BeginProbe(resume.Next, intent, due)
+	state, _ = chats.BeginProbe(resume.Next, intent, due, 0)
 	if got := chats.AbandonProbe(state, request, due, policy); got.Next != state || len(got.Effects) != 0 {
 		t.Fatalf("abandoning an older request released its replacement: %+v", got)
 	}
@@ -60,10 +60,16 @@ func TestAbandonProbeIgnoresMismatchedRequest(t *testing.T) {
 	state := lifecycleState(chats.Active)
 	state, request := chats.BeginProbe(state, chats.StartProbe{
 		Trigger: chats.ProbeUnknown, Actions: chats.FollowUp{Onboarding: true},
-	}, now)
+	}, now, 19)
+	if request.ErasureSequence != 19 {
+		t.Fatalf("Probe erasure sequence = %d, want 19", request.ErasureSequence)
+	}
+	wrongSequence := request
+	wrongSequence.ErasureSequence--
 	for _, stale := range []chats.ProbeRequest{
 		{},
 		{Trigger: request.Trigger, StartedAt: request.StartedAt.Add(-time.Second)},
+		wrongSequence,
 	} {
 		if got := chats.AbandonProbe(state, stale, now, policy); got.Next != state || len(got.Effects) != 0 {
 			t.Fatalf("abandonment of %+v changed request %+v: %+v", stale, request, got)
@@ -91,7 +97,7 @@ func TestAbandonProbeImmediatelyStartsQueuedTransition(t *testing.T) {
 			now, policy := lifecycleNow(), lifecyclePolicy()
 			state, request := chats.BeginProbe(lifecycleState(chats.Active), chats.StartProbe{
 				Trigger: chats.ProbeTransition, Actions: chats.FollowUp{Onboarding: true, LanguageCode: "en"},
-			}, now)
+			}, now, 0)
 			seq := state.MemberEpoch
 			queued := chats.Step(state, tc.update, now.Add(time.Second), policy)
 			lifecycleForbid[chats.StartProbe](t, queued)
@@ -100,8 +106,12 @@ func TestAbandonProbeImmediatelyStartsQueuedTransition(t *testing.T) {
 			restart := chats.AbandonProbe(state, request, restartAt, policy)
 			want := state
 			want.Probe = chats.ProbeState{LastStarted: request.StartedAt}
-			if restart.Next != want || restart.NewMemberEpoch || len(restart.Effects) != 1 {
+			if restart.Next != want || restart.NewMemberEpoch {
 				t.Fatalf("abandonment did not settle just the active and queued Probe work: %+v", restart)
+			}
+			guide, guided := lifecycleEffect[chats.OnboardingMessage](restart)
+			if guided == tc.guide || guided && (guide.Language.Actor != "en" || !guide.NeedsInviteUsers) {
+				t.Fatalf("abandonment guided the wrong membership: %+v", restart.Effects)
 			}
 			intent := lifecycleRequire[chats.StartProbe](t, restart)
 			wantIntent := chats.StartProbe{Trigger: chats.ProbeTransition}
@@ -111,7 +121,7 @@ func TestAbandonProbeImmediatelyStartsQueuedTransition(t *testing.T) {
 			if intent != wantIntent {
 				t.Fatalf("queued Probe intent = %+v, want %+v", intent, wantIntent)
 			}
-			state, replacement := chats.BeginProbe(restart.Next, intent, restartAt)
+			state, replacement := chats.BeginProbe(restart.Next, intent, restartAt, 0)
 			if replacement.MemberEpoch != seq || replacement.Version != state.Version {
 				t.Fatalf("replacement Probe did not snapshot current facts: %+v", replacement)
 			}
@@ -122,9 +132,46 @@ func TestAbandonProbeImmediatelyStartsQueuedTransition(t *testing.T) {
 			finished := chats.Step(state, lifecycleProbe(replacement, admin, tc.update.New.Rights), restartAt, policy)
 			lifecycleForbid[chats.StartProbe](t, finished)
 			msg, sent := lifecycleEffect[chats.OnboardingMessage](finished)
-			if sent != tc.guide || sent && (!msg.Ephemeral || msg.ReceiverID != tc.update.FromID || msg.Language.Actor != tc.update.LanguageCode) {
+			if sent != tc.guide || sent && msg.Language.Actor != tc.update.LanguageCode {
 				t.Fatalf("replacement Probe sent an incorrect guide: %+v", finished.Effects)
 			}
+		})
+	}
+}
+
+func TestAbandonedProbeGuidesUsingOnlyCommittedFacts(t *testing.T) {
+	now, policy := lifecycleNow(), lifecyclePolicy()
+	for _, tc := range []struct {
+		name     string
+		status   chats.ChatState
+		chatType models.ChatType
+		guide    bool
+	}{
+		{"current group", chats.Onboarding, models.ChatTypeSupergroup, true},
+		{"channel", chats.Onboarding, models.ChatTypeChannel, false},
+		{"departed", chats.Removed, models.ChatTypeSupergroup, false},
+		{"no record", chats.NoRecord, models.ChatTypeSupergroup, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := lifecycleState(tc.status)
+			state.Record.Type = tc.chatType
+			state.GuardKnown = true
+			state.Record.GuardAssigned = true
+			intent := chats.StartProbe{Trigger: chats.ProbeTransition, Actions: chats.FollowUp{Onboarding: true, LanguageCode: "zh-CN"}}
+			state, request := chats.BeginProbe(state, intent, now, 0)
+			result := lifecycleProbe(request, models.ChatMemberTypeAdministrator, chats.InviteUsers)
+			result.Chat.JoinByRequest = true
+			lifecycleRequire[chats.Persist](t, chats.Step(state, result, now, policy))
+
+			abandoned := chats.AbandonProbe(state, request, now, policy)
+			message, guided := lifecycleEffect[chats.OnboardingMessage](abandoned)
+			if guided != tc.guide {
+				t.Fatalf("abandonment guide = %v, want %v", guided, tc.guide)
+			}
+			if guided && (!message.GuardKnown || !message.GuardAssigned || !message.NeedsInviteUsers || message.JoinByRequest || message.Language.Actor != "zh-CN") {
+				t.Fatalf("abandonment guide did not use committed facts: %+v", message)
+			}
+			lifecycleForbid[chats.Persist](t, abandoned)
 		})
 	}
 }

@@ -35,7 +35,6 @@ func lifecycleState(state chats.ChatState) chats.State {
 		s.Record.Type = models.ChatTypeSupergroup
 		s.Record.Title = "Example"
 		s.Record.OwnerID = 4
-		s.Record.AddedBy = 5
 		s.Record.AddedAt = lifecycleNow().Add(-8 * 24 * time.Hour).Unix()
 		s.Record.UpdatedAt = s.Record.AddedAt
 		s.MemberEpoch = 6
@@ -57,7 +56,7 @@ func lifecycleState(state chats.ChatState) chats.State {
 func lifecycleUpdate(id int64, old, new models.ChatMemberType, rights chats.BotRights) chats.MemberUpdate {
 	return chats.MemberUpdate{
 		Order: dispatch.Order{Date: lifecycleNow().Unix(), ID: id},
-		Type:  models.ChatTypeSupergroup, Title: "Example", FromID: 12, LanguageCode: "zh-CN",
+		Type:  models.ChatTypeSupergroup, Title: "Example", LanguageCode: "zh-CN",
 		Old: chats.Membership{Status: old}, New: chats.Membership{Status: new, Rights: rights},
 	}
 }
@@ -108,7 +107,7 @@ func lifecycleCommit(d chats.Decision, now time.Time, seq *uint64) chats.State {
 		next.MemberEpoch = *seq
 	}
 	if intent, ok := lifecycleEffect[chats.StartProbe](d); ok {
-		next, _ = chats.BeginProbe(next, intent, now)
+		next, _ = chats.BeginProbe(next, intent, now, 0)
 	}
 	return next
 }
@@ -175,7 +174,7 @@ func TestCommitAllocatesEpochForInferredReentry(t *testing.T) {
 			join := lifecycleUpdate(1, departed, models.ChatMemberTypeAdministrator, chats.InviteUsers)
 			d := chats.Step(s, join, now, policy)
 			record := lifecycleRequire[chats.Persist](t, d).Record
-			if !d.NewMemberEpoch || d.Next.MemberEpoch != s.MemberEpoch || record.OwnerID != 0 || record.AddedBy != join.FromID ||
+			if !d.NewMemberEpoch || d.Next.MemberEpoch != s.MemberEpoch || record.OwnerID != 0 ||
 				record.AddedAt != now.Unix() || record.UpdatedAt != s.Record.UpdatedAt || record.State != chats.Active || !d.Next.Probe.Pending {
 				t.Fatalf("same-state reentry was not proposed correctly %+v", d)
 			}
@@ -195,8 +194,8 @@ func TestCommitAllocatesEpochForInferredReentry(t *testing.T) {
 				t.Fatalf("Probe did not snapshot committed membership %+v", s.Probe.InFlight)
 			}
 			d = chats.Step(s, lifecycleProbe(s.Probe.InFlight, models.ChatMemberTypeAdministrator, chats.InviteUsers), now, policy)
-			if msg := lifecycleRequire[chats.OnboardingMessage](t, d); !msg.Ephemeral || msg.ReceiverID != join.FromID || msg.MemberEpoch != seq {
-				t.Fatalf("onboarding targeted wrong membership %+v", msg)
+			if msg := lifecycleRequire[chats.OnboardingMessage](t, d); msg.Language.Actor != join.LanguageCode {
+				t.Fatalf("onboarding lost current membership language: %+v", msg)
 			}
 		})
 	}
@@ -244,7 +243,7 @@ func TestProbeAdmissionAndIdleAfterRecentCompletion(t *testing.T) {
 		t.Run(tc.netAge.String()+map[bool]string{true: "/idle", false: "/report"}[tc.idle], func(t *testing.T) {
 			s := lifecycleState(chats.Onboarding)
 			startedAt := now.Add(-tc.netAge)
-			s, request := chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbeUnknown}, startedAt)
+			s, request := chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbeUnknown}, startedAt, 0)
 			s = chats.Step(s, lifecycleProbe(request, models.ChatMemberTypeMember, 0), startedAt.Add(time.Second), policy).Next
 			trigger := chats.ProbeUnknown
 			if tc.idle {
@@ -364,7 +363,7 @@ func TestPurgeAfterMembershipEvents(t *testing.T) {
 	}
 }
 
-func TestIdleLeaveUsesCurrentEpochAndPreservesRemoval(t *testing.T) {
+func TestIdleLeaveCarriesVerifiedFactsAndPreservesRemoval(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
 	s := lifecycleState(chats.Onboarding)
 	s.Record.UpdatedAt = now.Add(-policy.IdleLeaveAfter).Unix()
@@ -374,7 +373,8 @@ func TestIdleLeaveUsesCurrentEpochAndPreservesRemoval(t *testing.T) {
 	probe := lifecycleProbe(s.Probe.InFlight, models.ChatMemberTypeMember, 0)
 	d = chats.Step(s, probe, now, policy)
 	leave := lifecycleRequire[chats.LeaveChat](t, d)
-	if leave.Source != chats.LeaveIdle || !leave.NoRetry || leave.Class != sender.Background || leave.Membership != s.MembershipSnapshot() {
+	if leave.Source != chats.LeaveIdle || !leave.NoRetry || leave.Class != sender.Background ||
+		leave.Membership != s.MembershipSnapshot() || leave.FactVersion != s.Version {
 		t.Fatalf("idle leave has wrong request %+v", leave)
 	}
 	s = lifecycleCommit(d, now, &seq)
@@ -389,7 +389,9 @@ func TestIdleLeaveUsesCurrentEpochAndPreservesRemoval(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d = chats.Step(s, tc.update, now, policy)
 			state := lifecycleCommit(d, now, &seq)
-			d = chats.Step(state, chats.LeaveFinished{Source: leave.Source, Membership: leave.Membership, Result: lifecycleResult(telegram.OK)}, now.Add(time.Second), policy)
+			d = chats.Step(state, chats.LeaveFinished{
+				Source: leave.Source, Membership: leave.Membership, FactVersion: leave.FactVersion, Result: lifecycleResult(telegram.OK),
+			}, now.Add(time.Second), policy)
 			if !tc.wantWrites {
 				lifecycleForbid[chats.Persist](t, d)
 				if d.Next != state || !d.Stale {
@@ -468,7 +470,7 @@ func TestRecordlessDeparturePreservesAdministratorEvidence(t *testing.T) {
 					d = chats.Step(state, lifecycleUpdate(4, left, member, 0), now, policy)
 				} else {
 					start := chats.Step(state, chats.ProbeTriggered{Trigger: chats.ProbeUnknown}, now, policy)
-					state, request := chats.BeginProbe(start.Next, lifecycleRequire[chats.StartProbe](t, start), now)
+					state, request := chats.BeginProbe(start.Next, lifecycleRequire[chats.StartProbe](t, start), now, 0)
 					d = chats.Step(state, lifecycleProbe(request, member, 0), now, policy)
 				}
 				row := lifecycleRequire[chats.Persist](t, d).Record
@@ -480,16 +482,17 @@ func TestRecordlessDeparturePreservesAdministratorEvidence(t *testing.T) {
 	}
 }
 
-func TestOldAdminEvidenceSurvivesUpdatesThatCannotAdmitChat(t *testing.T) {
+func TestOldAdminEvidenceRequiresAValidUpdate(t *testing.T) {
 	admin, member, left := models.ChatMemberTypeAdministrator, models.ChatMemberTypeMember, models.ChatMemberTypeLeft
 	for _, tc := range []struct {
-		name   string
-		before chats.ChatState
-		new    models.ChatMemberType
+		name           string
+		before         chats.ChatState
+		new            models.ChatMemberType
+		wantEverActive bool
 	}{
-		{"rejected without a record", chats.NoRecord, member},
-		{"rejected with a removed record", chats.Removed, member},
-		{"unrecognized new status", chats.NoRecord, "unknown"},
+		{"rejected without a record", chats.NoRecord, member, true},
+		{"rejected with a removed record", chats.Removed, member, true},
+		{"unrecognized new status", chats.NoRecord, "unknown", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now, policy := lifecycleNow(), lifecyclePolicy()
@@ -501,8 +504,8 @@ func TestOldAdminEvidenceSurvivesUpdatesThatCannotAdmitChat(t *testing.T) {
 			}
 			policy.AcceptNewChats = true
 			joined := chats.Step(d.Next, lifecycleUpdate(2, left, member, 0), now, policy)
-			if row := lifecycleRequire[chats.Persist](t, joined).Record; row.State != chats.Onboarding || !row.EverActive {
-				t.Fatalf("joining lost evidence of a prior administrator: %+v", row)
+			if row := lifecycleRequire[chats.Persist](t, joined).Record; row.State != chats.Onboarding || row.EverActive != tc.wantEverActive {
+				t.Fatalf("joining produced the wrong administrator history: %+v", row)
 			}
 		})
 	}
@@ -668,34 +671,31 @@ func TestMigrationEnrichmentIsIdempotentAndClearsOnRejoin(t *testing.T) {
 	}
 }
 
-func TestOnboardingDeliveryAndCooldown(t *testing.T) {
+func TestOnboardingUsesProbeFacts(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
 	policy.Language = "zh-Hans"
 	for _, tc := range []struct {
-		name      string
-		chatType  models.ChatType
-		status    models.ChatMemberType
-		rights    chats.BotRights
-		last      time.Duration
-		want      bool
-		ephemeral bool
+		name     string
+		chatType models.ChatType
+		status   models.ChatMemberType
+		rights   chats.BotRights
+		want     bool
+		guard    bool
 	}{
-		{"ordinary at boundary", models.ChatTypeSupergroup, models.ChatMemberTypeMember, 0, lifecycleMessageCooldown, true, false},
-		{"ordinary before boundary", models.ChatTypeSupergroup, models.ChatMemberTypeMember, 0, lifecycleMessageCooldown - time.Second, false, false},
-		{"administrator with invite", models.ChatTypeSupergroup, models.ChatMemberTypeAdministrator, chats.InviteUsers, time.Second, true, true},
-		{"administrator missing invite", models.ChatTypeSupergroup, models.ChatMemberTypeAdministrator, 0, time.Second, true, true},
-		{"channel", models.ChatTypeChannel, models.ChatMemberTypeAdministrator, chats.InviteUsers, lifecycleMessageCooldown, false, false},
+		{"member", models.ChatTypeSupergroup, models.ChatMemberTypeMember, 0, true, false},
+		{"administrator with invite", models.ChatTypeSupergroup, models.ChatMemberTypeAdministrator, chats.InviteUsers, true, true},
+		{"administrator missing invite", models.ChatTypeSupergroup, models.ChatMemberTypeAdministrator, 0, true, true},
+		{"channel", models.ChatTypeChannel, models.ChatMemberTypeAdministrator, chats.InviteUsers, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := lifecycleState(chats.Removed)
-			s.LastOnboarding = now.Add(-tc.last)
 			var seq uint64
 			join := lifecycleUpdate(1, models.ChatMemberTypeLeft, tc.status, tc.rights)
 			join.Type = tc.chatType
 			d := chats.Step(s, join, now, policy)
 			s = lifecycleCommit(d, now, &seq)
 			probe := lifecycleProbe(s.Probe.InFlight, tc.status, tc.rights)
-			probe.Chat.Type, probe.Chat.GuardAssigned, probe.Chat.JoinByRequest = tc.chatType, tc.ephemeral, true
+			probe.Chat.Type, probe.Chat.GuardAssigned, probe.Chat.JoinByRequest = tc.chatType, tc.guard, true
 			d = chats.Step(s, probe, now, policy)
 			message, ok := lifecycleEffect[chats.OnboardingMessage](d)
 			if ok != tc.want {
@@ -704,77 +704,27 @@ func TestOnboardingDeliveryAndCooldown(t *testing.T) {
 			if !ok {
 				return
 			}
-			wantReceiver, wantLast := int64(0), now
-			if tc.ephemeral {
-				wantReceiver, wantLast = join.FromID, s.LastOnboarding
-			}
 			want := chats.OnboardingMessage{
-				Language:   chats.LanguageCandidates{Group: policy.Language, Actor: join.LanguageCode},
-				ReceiverID: wantReceiver, MemberEpoch: seq, Ephemeral: tc.ephemeral,
-				GuardAssigned: tc.ephemeral, GuardKnown: tc.ephemeral, JoinByRequest: true, NeedsInviteUsers: tc.rights == 0,
+				Language:      chats.LanguageCandidates{Group: policy.Language, Actor: join.LanguageCode},
+				GuardAssigned: tc.guard, GuardKnown: tc.guard, JoinByRequest: true, NeedsInviteUsers: tc.rights == 0,
 			}
-			if message != want || d.Next.LastOnboarding != wantLast {
-				t.Fatalf("wrong onboarding or cooldown: got %+v at %v, want %+v at %v", message, d.Next.LastOnboarding, want, wantLast)
-			}
-		})
-	}
-}
-
-func TestEphemeralFailureFallsBackOnlyForCurrentMembership(t *testing.T) {
-	now, policy := lifecycleNow(), lifecyclePolicy()
-	for _, tc := range []struct {
-		name     string
-		result   sender.Result
-		epoch    uint64
-		receiver int64
-		chatType models.ChatType
-		last     time.Duration
-		want     bool
-	}{
-		{"ordinary fallback", lifecycleResult(telegram.Retry), 6, 5, models.ChatTypeSupergroup, lifecycleMessageCooldown, true},
-		{"cooldown", lifecycleResult(telegram.Retry), 6, 5, models.ChatTypeSupergroup, lifecycleMessageCooldown - time.Second, false},
-		{"sent", lifecycleResult(telegram.OK), 6, 5, models.ChatTypeSupergroup, lifecycleMessageCooldown, false},
-		{"rejoined", lifecycleResult(telegram.Fatal), 5, 5, models.ChatTypeSupergroup, lifecycleMessageCooldown, false},
-		{"different recipient", lifecycleResult(telegram.Fatal), 6, 4, models.ChatTypeSupergroup, lifecycleMessageCooldown, false},
-		{"channel", lifecycleResult(telegram.Fatal), 6, 5, models.ChatTypeChannel, lifecycleMessageCooldown, false},
-		{"dropped", sender.DroppedResult(sender.Expired, errors.New("expired")), 6, 5, models.ChatTypeSupergroup, lifecycleMessageCooldown, true},
-		{"shutdown", sender.DroppedResult(sender.Shutdown, errors.New("stopped")), 6, 5, models.ChatTypeSupergroup, lifecycleMessageCooldown, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := lifecycleState(chats.Active)
-			s.Record.Type, s.LastOnboarding = tc.chatType, now.Add(-tc.last)
-			d := chats.Step(s, chats.OnboardingFinished{MemberEpoch: tc.epoch, ReceiverID: tc.receiver, LanguageCode: "zh-CN", Result: tc.result}, now, policy)
-			if d.Stale != (tc.epoch != s.MemberEpoch) {
-				t.Fatalf("ephemeral completion staleness = %v for epoch %d", d.Stale, tc.epoch)
-			}
-			if d.Next.Version != s.Version {
-				t.Fatalf("ephemeral completion fact version = %d, want %d", d.Next.Version, s.Version)
-			}
-			if metric := lifecycleRequire[chats.Metric](t, d); metric.Kind != chats.OnboardingOutcome || metric.Outcome != tc.result.Outcome ||
-				metric.Dropped != tc.result.Dropped || metric.Error != (tc.result.Outcome.Class == telegram.Fatal) {
-				t.Fatalf("unexpected ephemeral delivery metric %+v", metric)
-			}
-			message, ok := lifecycleEffect[chats.OnboardingMessage](d)
-			if ok != tc.want || ok && (message.Ephemeral || message.ReceiverID != 0 || message.Language != (chats.LanguageCandidates{Actor: "zh-CN"}) || d.Next.LastOnboarding != now) {
-				t.Fatalf("wrong fallback effects %+v and state %+v", d.Effects, d.Next)
+			if message != want {
+				t.Fatalf("onboarding = %+v, want %+v", message, want)
 			}
 		})
 	}
 }
 
-func TestOnboardingStillRunsWhenProbeFailsUnlessAddingUserWasErased(t *testing.T) {
+func TestOnboardingStillRunsWhenProbeFails(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
 	join := lifecycleUpdate(1, models.ChatMemberTypeLeft, models.ChatMemberTypeMember, 0)
 	seq := uint64(50)
 	s := lifecycleCommit(chats.Step(lifecycleState(chats.NoRecord), join, now, policy), now, &seq)
 	probe := chats.ProbeFinished{Request: s.Probe.InFlight, Chat: chats.ProbeChat{Result: lifecycleResult(telegram.Fatal)}}
 	d := chats.Step(s, probe, now, policy)
-	if msg := lifecycleRequire[chats.OnboardingMessage](t, d); msg.GuardKnown || msg.Ephemeral || msg.Language.Actor != join.LanguageCode {
+	if msg := lifecycleRequire[chats.OnboardingMessage](t, d); msg.GuardKnown || msg.Language.Actor != join.LanguageCode {
 		t.Fatalf("failed Probe lost generic onboarding context %+v", msg)
 	}
-	s.Record.AddedBy = 0
-	d = chats.Step(s, probe, now, policy)
-	lifecycleForbid[chats.OnboardingMessage](t, d)
 }
 
 func TestDowngradeNotificationCooldownAndChannels(t *testing.T) {
@@ -811,7 +761,7 @@ func TestDowngradeNotificationCooldownAndChannels(t *testing.T) {
 						actor, event = update.LanguageCode, update
 					} else {
 						var request chats.ProbeRequest
-						s, request = chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbePermissionLost}, now)
+						s, request = chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbePermissionLost}, now, 0)
 						result := lifecycleProbe(request, target.role, 0)
 						result.Chat.Type = tc.typeOf
 						event = result
@@ -875,7 +825,7 @@ func TestReentryAsMemberUsesOnboardingWithoutDowngrade(t *testing.T) {
 			d := chats.Step(state, join, now, policy)
 			lifecycleForbid[chats.DowngradeMessage](t, d)
 			if row := lifecycleRequire[chats.Persist](t, d).Record; row.State != chats.Onboarding || row.OwnerID != 0 ||
-				row.AddedBy != join.FromID || !d.NewMemberEpoch || d.Next.LastDowngrade != state.LastDowngrade {
+				!d.NewMemberEpoch || d.Next.LastDowngrade != state.LastDowngrade {
 				t.Fatalf("reentry was not treated as new membership: %+v", d)
 			}
 			seq := state.MemberEpoch
@@ -910,7 +860,7 @@ func TestProbeAllowsOwnerToBeUnknownAndUsesFreshMetadata(t *testing.T) {
 func TestProbeResultsIgnoreOtherRequestsAndFlagUnknownMembership(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
 	s := lifecycleState(chats.Active)
-	s, request := chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbeUnknown}, now)
+	s, request := chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbeUnknown}, now, 0)
 	before := request
 	before.StartedAt = before.StartedAt.Add(-time.Minute)
 	d := chats.Step(s, lifecycleProbe(before, models.ChatMemberTypeMember, 0), now, policy)
@@ -935,7 +885,7 @@ func TestProbeResultsIgnoreOtherRequestsAndFlagUnknownMembership(t *testing.T) {
 func TestProbeCanNotifyOfDowngrade(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
 	s := lifecycleState(chats.Active)
-	s, request := chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbePermissionLost}, now)
+	s, request := chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbePermissionLost}, now, 0)
 	d := chats.Step(s, lifecycleProbe(request, models.ChatMemberTypeAdministrator, 0), now, policy)
 	lifecycleRequire[chats.DowngradeMessage](t, d)
 	if row := lifecycleRequire[chats.Persist](t, d).Record; row.State != chats.Degraded || d.NewMemberEpoch || d.Next.LastDowngrade != now {
@@ -947,7 +897,7 @@ func TestStepPreservesInput(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
 	for _, state := range []chats.ChatState{chats.NoRecord, chats.Active, chats.Removed} {
 		s := lifecycleState(state)
-		s, request := chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbeUnknown, Actions: chats.FollowUp{Idle: true}}, now)
+		s, request := chats.BeginProbe(s, chats.StartProbe{Trigger: chats.ProbeUnknown, Actions: chats.FollowUp{Idle: true}}, now, 0)
 		before := s
 		events := []chats.Event{
 			lifecycleUpdate(1, models.ChatMemberTypeLeft, models.ChatMemberTypeAdministrator, chats.InviteUsers),

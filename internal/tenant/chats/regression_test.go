@@ -87,7 +87,7 @@ func TestReentryDiscardsAttachedIdleCheck(t *testing.T) {
 			if retry.Next.Probe.IdlePending {
 				t.Fatalf("new membership was considered idle: %+v", retry)
 			}
-			state, request = chats.BeginProbe(completion.Next, pending, now.Add(time.Second))
+			state, request = chats.BeginProbe(completion.Next, pending, now.Add(time.Second), 0)
 			fresh := chats.Step(state, lifecycleProbe(request, models.ChatMemberTypeMember, 0), now.Add(time.Second), policy)
 			lifecycleForbid[chats.LeaveChat](t, fresh)
 			lifecycleRequire[chats.OnboardingMessage](t, fresh)
@@ -123,7 +123,7 @@ func TestRecordlessDepartureDiscardsOlderRecoveryProbe(t *testing.T) {
 	}
 }
 
-func TestMembershipAdmissionAttributesOnlyPayloadProvenJoin(t *testing.T) {
+func TestMembershipAdmissionGuidesForEveryPreviousIdentity(t *testing.T) {
 	admin := models.ChatMemberTypeAdministrator
 	for _, tc := range []struct {
 		name  string
@@ -149,14 +149,13 @@ func TestMembershipAdmissionAttributesOnlyPayloadProvenJoin(t *testing.T) {
 				ev.Old = tc.old
 				d := chats.Step(state, ev, now, policy)
 				row := lifecycleRequire[chats.Persist](t, d).Record
-				wantBy, wantAt := int64(0), state.Record.AddedAt
-				wantProbe := chats.StartProbe{Trigger: chats.ProbeTransition}
+				wantAt := state.Record.AddedAt
+				wantProbe := chats.StartProbe{Trigger: chats.ProbeTransition, Actions: chats.FollowUp{Onboarding: true, LanguageCode: ev.LanguageCode}}
 				if tc.joins {
-					wantBy, wantAt = ev.FromID, now.Unix()
-					wantProbe.Actions = chats.FollowUp{Onboarding: true, LanguageCode: ev.LanguageCode}
+					wantAt = now.Unix()
 				}
 				if row.State != chats.Active || row.OwnerID != 0 || !d.NewMemberEpoch || row.Watermark != ev.Order ||
-					row.AddedBy != wantBy || row.AddedAt != wantAt || row.RemovedAt != 0 || row.RemovedReason != "" || row.PurgeAfter != 0 {
+					row.AddedAt != wantAt || row.RemovedAt != 0 || row.RemovedReason != "" || row.PurgeAfter != 0 {
 					t.Fatalf("admission stored incorrect membership: %+v", d)
 				}
 				if intent := lifecycleRequire[chats.StartProbe](t, d); intent != wantProbe {
@@ -164,8 +163,7 @@ func TestMembershipAdmissionAttributesOnlyPayloadProvenJoin(t *testing.T) {
 				}
 				state = lifecycleCommit(d, now, &seq)
 				finished := chats.Step(state, lifecycleProbe(state.Probe.InFlight, admin, chats.InviteUsers), now, policy)
-				msg, sent := lifecycleEffect[chats.OnboardingMessage](finished)
-				if sent != tc.joins || sent && msg.ReceiverID != ev.FromID {
+				if msg := lifecycleRequire[chats.OnboardingMessage](t, finished); msg.Language.Actor != ev.LanguageCode {
 					t.Fatalf("admission sent an incorrect guide: %+v", finished.Effects)
 				}
 			})
@@ -180,16 +178,19 @@ func TestMissedJoinSupersedesGuideQueuedForPreviousMembership(t *testing.T) {
 	seq := state.MemberEpoch
 	state = lifecycleCommit(chats.Step(state, chats.ProbeTriggered{Trigger: chats.ProbeUnknown}, now, policy), now, &seq)
 	request := state.Probe.InFlight
+	recovery := lifecycleUpdate(3, member, admin, chats.InviteUsers)
+	recovery.LanguageCode = "en"
 	for _, update := range []chats.MemberUpdate{
 		lifecycleUpdate(1, left, member, 0),
 		lifecycleUpdate(2, member, left, 0),
-		lifecycleUpdate(3, member, admin, chats.InviteUsers),
+		recovery,
 	} {
 		now = now.Add(time.Second)
 		state = lifecycleCommit(chats.Step(state, update, now, policy), now, &seq)
 	}
 	finished := chats.Step(state, lifecycleProbe(request, admin, chats.InviteUsers), now, policy)
-	if intent := lifecycleRequire[chats.StartProbe](t, finished); intent != (chats.StartProbe{Trigger: chats.ProbeTransition}) {
+	want := chats.StartProbe{Trigger: chats.ProbeTransition, Actions: chats.FollowUp{Onboarding: true, LanguageCode: recovery.LanguageCode}}
+	if intent := lifecycleRequire[chats.StartProbe](t, finished); intent != want {
 		t.Fatalf("recovery inherited a guide from the previous membership: %+v", intent)
 	}
 	lifecycleForbid[chats.OnboardingMessage](t, finished)
@@ -240,11 +241,16 @@ func TestIdleCheckRequiresCurrentProbeVersionAndMembership(t *testing.T) {
 				t.Fatalf("unexpected leave decision: %+v, want leave %v", completion, tc.wantIdleLeave)
 			}
 			if ok {
-				want := chats.LeaveChat{Source: chats.LeaveIdle, Membership: state.MembershipSnapshot(), Class: sender.Background, NoRetry: true}
+				want := chats.LeaveChat{
+					Source: chats.LeaveIdle, Membership: state.MembershipSnapshot(), FactVersion: state.Version,
+					Class: sender.Background, NoRetry: true,
+				}
 				if leave != want {
 					t.Fatalf("idle leave = %+v, want %+v", leave, want)
 				}
-				finished := chats.LeaveFinished{Source: leave.Source, Membership: leave.Membership, Result: lifecycleResult(telegram.OK)}
+				finished := chats.LeaveFinished{
+					Source: leave.Source, Membership: leave.Membership, FactVersion: leave.FactVersion, Result: lifecycleResult(telegram.OK),
+				}
 				left := chats.Step(completion.Next, finished, now, policy)
 				if row := lifecycleRequire[chats.Persist](t, left).Record; row.State != chats.Removed || row.PurgeAfter != now.Unix() {
 					t.Fatalf("idle leave did not remove the chat: %+v", row)
@@ -294,7 +300,7 @@ func TestStaleIdleProbeSchedulesFreshVerification(t *testing.T) {
 			if intent.Trigger != chats.ProbeIdle || !intent.Actions.Idle {
 				t.Fatalf("fresh Probe lost the idle action: %+v", intent)
 			}
-			state, current := chats.BeginProbe(finish.Next, intent, finishedAt)
+			state, current := chats.BeginProbe(finish.Next, intent, finishedAt, 0)
 			lifecycleForbid[chats.LeaveChat](t, chats.Step(state, older, finishedAt, policy))
 			fresh := chats.Step(state, lifecycleProbe(current, models.ChatMemberTypeMember, 0), finishedAt, policy)
 			lifecycleRequire[chats.LeaveChat](t, fresh)
@@ -380,7 +386,9 @@ func TestIdleLeaveRequiresFreshSuccessfulProbeEachTime(t *testing.T) {
 			if !limited.Next.Probe.IdlePending {
 				t.Fatalf("rate-limited idle request was lost: %+v", limited)
 			}
-			retry := chats.LeaveFinished{Source: leave.Source, Membership: leave.Membership, Result: lifecycleResult(telegram.Retry)}
+			retry := chats.LeaveFinished{
+				Source: leave.Source, Membership: leave.Membership, FactVersion: leave.FactVersion, Result: lifecycleResult(telegram.Retry),
+			}
 			failed := chats.Step(limited.Next, retry, now.Add(3*time.Second), policy)
 			lifecycleForbid[chats.Persist](t, failed)
 			lifecycleForbid[chats.LeaveChat](t, failed)
@@ -395,7 +403,7 @@ func TestIdleLeaveRequiresFreshSuccessfulProbeEachTime(t *testing.T) {
 			if !intent.Actions.Idle || !decision.Next.Probe.IdlePending {
 				t.Fatalf("unstarted Probe lost the pending idle request: %+v", decision)
 			}
-			state, freshRequest := chats.BeginProbe(decision.Next, intent, due)
+			state, freshRequest := chats.BeginProbe(decision.Next, intent, due, 0)
 			if state.Probe.IdlePending {
 				t.Fatalf("started Probe left an idle request pending: %+v", state.Probe)
 			}
@@ -421,7 +429,7 @@ func TestPendingIdleProbeRechecksEligibility(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			now, policy := lifecycleNow(), lifecyclePolicy()
 			state := lifecycleState(chats.Onboarding)
-			started, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbeUnknown}, now)
+			started, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbeUnknown}, now, 0)
 			state = chats.Step(started, lifecycleProbe(request, models.ChatMemberTypeMember, 0), now, policy).Next
 			idle := chats.ProbeTriggered{Trigger: chats.ProbeIdle}
 			limited := chats.Step(state, idle, now.Add(time.Second), policy)
@@ -452,6 +460,7 @@ func TestStaleProbeGuidesTheSameMembershipUsingCurrentState(t *testing.T) {
 	seq := uint64(50)
 	removed := lifecycleState(chats.Removed)
 	removed.Record.GuardAssigned, removed.GuardKnown = true, true
+	removed.JoinByRequest = true
 	state := lifecycleCommit(chats.Step(removed, join, now, policy), now, &seq)
 	request := state.Probe.InFlight
 	update := lifecycleUpdate(2, models.ChatMemberTypeMember, models.ChatMemberTypeAdministrator, chats.InviteUsers)
@@ -461,10 +470,10 @@ func TestStaleProbeGuidesTheSameMembershipUsingCurrentState(t *testing.T) {
 	result.Chat.GuardAssigned, result.Chat.JoinByRequest = true, true
 	completion := chats.Step(state, result, now, policy)
 	message := lifecycleRequire[chats.OnboardingMessage](t, completion)
-	if !message.Ephemeral || message.ReceiverID != join.FromID || message.Language.Actor != join.LanguageCode ||
+	if message.Language.Actor != join.LanguageCode ||
 		message.GuardKnown || message.JoinByRequest || message.NeedsInviteUsers ||
-		!completion.Next.Record.GuardAssigned {
-		t.Fatalf("onboarding used stale Probe data or lost the joining user: %+v", message)
+		completion.Next.Record.GuardAssigned {
+		t.Fatalf("onboarding used stale Probe data or lost the trigger language: %+v", message)
 	}
 	pending := lifecycleRequire[chats.StartProbe](t, completion)
 	if pending.Actions.Onboarding {
@@ -477,7 +486,6 @@ func TestProbeRefreshesGuardAssignmentOnlyWhenVisible(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		status       models.ChatMemberType
-		chatClass    telegram.Class
 		memberClass  telegram.Class
 		visible      bool
 		wantKnown    bool
@@ -485,23 +493,21 @@ func TestProbeRefreshesGuardAssignmentOnlyWhenVisible(t *testing.T) {
 		wantJoin     bool
 		wantPersist  bool
 	}{
-		{name: "member", status: member, chatClass: telegram.OK, memberClass: telegram.OK, wantAssigned: true, wantJoin: true, wantPersist: true},
-		{name: "membership query failed", status: admin, chatClass: telegram.OK, memberClass: telegram.Retry, wantAssigned: true, wantJoin: true},
-		{name: "chat query failed", chatClass: telegram.Retry, wantAssigned: true},
-		{name: "visible assignment despite membership failure", status: admin, chatClass: telegram.OK, memberClass: telegram.Retry, visible: true, wantKnown: true, wantAssigned: true, wantJoin: true},
-		{name: "admin confirmed no assignment", status: admin, chatClass: telegram.OK, memberClass: telegram.OK, wantKnown: true, wantJoin: true, wantPersist: true},
+		{name: "member", status: member, memberClass: telegram.OK, wantAssigned: true, wantJoin: true, wantPersist: true},
+		{name: "membership query failed", status: admin, memberClass: telegram.Retry, wantAssigned: true, wantJoin: true},
+		{name: "visible assignment despite membership failure", status: admin, memberClass: telegram.Retry, visible: true, wantKnown: true, wantAssigned: true, wantJoin: true},
+		{name: "admin confirmed no assignment", status: admin, memberClass: telegram.OK, wantKnown: true, wantJoin: true, wantPersist: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now, policy := lifecycleNow(), lifecyclePolicy()
 			state := lifecycleState(chats.Active)
 			state.Record.GuardAssigned, state.GuardKnown = true, true
-			state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbePeriodic}, now)
+			state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbePeriodic}, now, 0)
 			var rights chats.BotRights
 			if tc.status == admin {
 				rights = chats.InviteUsers
 			}
 			result := lifecycleProbe(request, tc.status, rights)
-			result.Chat.Result = lifecycleResult(tc.chatClass)
 			result.Chat.JoinByRequest = true
 			result.Chat.GuardVisible, result.Chat.GuardAssigned = tc.visible, tc.visible
 			result.Member.Result = lifecycleResult(tc.memberClass)
@@ -516,12 +522,44 @@ func TestProbeRefreshesGuardAssignmentOnlyWhenVisible(t *testing.T) {
 	}
 }
 
+func TestFailedGetChatPreservesConfirmedMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		failed sender.Result
+	}{
+		{"retry", lifecycleResult(telegram.Retry)},
+		{"dropped", sender.DroppedResult(sender.Busy, sender.ErrBusy)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now, policy := lifecycleNow(), lifecyclePolicy()
+			intent := chats.StartProbe{Trigger: chats.ProbePeriodic}
+			state, request := chats.BeginProbe(lifecycleState(chats.Active), intent, now, 0)
+			success := lifecycleProbe(request, models.ChatMemberTypeAdministrator, chats.InviteUsers)
+			success.Chat.GuardVisible, success.Chat.GuardAssigned, success.Chat.JoinByRequest = true, true, true
+			before := chats.Step(state, success, now, policy).Next
+			if !before.GuardKnown || !before.Record.GuardAssigned || !before.JoinByRequest {
+				t.Fatalf("successful Probe did not confirm metadata: %+v", before)
+			}
+
+			later := now.Add(chats.ProbeInterval)
+			state, request = chats.BeginProbe(before, intent, later, 0)
+			failed := chats.ProbeFinished{Request: request, Chat: chats.ProbeChat{Result: tc.failed}}
+			completed := chats.Step(state, failed, later, policy)
+			matrixPersist(t, completed, false)
+			after := completed.Next
+			if after.Record != before.Record || after.GuardKnown != before.GuardKnown || after.JoinByRequest != before.JoinByRequest {
+				t.Fatalf("failed getChat changed confirmed metadata from %+v to %+v", before, after)
+			}
+		})
+	}
+}
+
 func TestStaleProbeKeepsCurrentMetadataAndChecksOwnerSeparately(t *testing.T) {
 	for _, class := range []telegram.Class{telegram.OK, telegram.Permission} {
 		t.Run(class.String(), func(t *testing.T) {
 			now, policy := lifecycleNow(), lifecyclePolicy()
 			state := lifecycleState(chats.Active)
-			state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbeUnknown}, now.Add(-time.Minute))
+			state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbeUnknown}, now.Add(-time.Minute), 0)
 			downgrade := lifecycleUpdate(1, models.ChatMemberTypeAdministrator, models.ChatMemberTypeAdministrator, 0)
 			downgrade.Old.Rights = chats.InviteUsers
 			downgrade.Title = "current title"
@@ -568,7 +606,7 @@ func TestSameStateMemberUpdateInvalidatesOlderProbeRights(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			now, policy := lifecycleNow(), lifecyclePolicy()
 			state := lifecycleState(chats.Active)
-			state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbePeriodic}, now)
+			state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbePeriodic}, now, 0)
 			update := lifecycleUpdate(1, models.ChatMemberTypeAdministrator, models.ChatMemberTypeAdministrator, tc.newRights)
 			update.Old.Rights = tc.oldRights
 			member := chats.Step(state, update, now.Add(time.Second), policy)
@@ -606,7 +644,7 @@ func TestClearDiscardsQueuedProbeWork(t *testing.T) {
 			state := lifecycleState(tc.initial)
 			seq := state.MemberEpoch
 			start := chats.Step(state, chats.ProbeTriggered{Trigger: tc.trigger}, now, policy)
-			state, request := chats.BeginProbe(start.Next, lifecycleRequire[chats.StartProbe](t, start), now)
+			state, request := chats.BeginProbe(start.Next, lifecycleRequire[chats.StartProbe](t, start), now, 0)
 
 			change := chats.Step(state, tc.update, now.Add(time.Second), policy)
 			lifecycleForbid[chats.StartProbe](t, change)
@@ -724,7 +762,9 @@ func TestSameSecondLeaveCompletionKeepsRecoveryProbeValid(t *testing.T) {
 			now, policy := lifecycleNow(), lifecyclePolicy()
 			state := lifecycleState(chats.Removed)
 			seq := state.MemberEpoch
-			leave := chats.LeaveFinished{Source: source, Membership: state.MembershipSnapshot(), Result: lifecycleResult(telegram.OK)}
+			leave := chats.LeaveFinished{
+				Source: source, Membership: state.MembershipSnapshot(), FactVersion: state.Version, Result: lifecycleResult(telegram.OK),
+			}
 			first := chats.Step(state, leave, now, policy)
 			if row := lifecycleRequire[chats.Persist](t, first).Record; row.PurgeAfter != now.Unix() {
 				t.Fatalf("first completion did not set the deadline: %+v", row)
@@ -754,7 +794,7 @@ func TestSameSecondLeaveCompletionKeepsRecoveryProbeValid(t *testing.T) {
 
 func TestSameOwnerClaimProtectsOwnerWithoutWriting(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
-	state, request := chats.BeginProbe(lifecycleState(chats.Active), chats.StartProbe{Trigger: chats.ProbeUnknown}, now)
+	state, request := chats.BeginProbe(lifecycleState(chats.Active), chats.StartProbe{Trigger: chats.ProbeUnknown}, now, 0)
 	claim := chats.Step(state, chats.OwnerSet{UserID: state.Record.OwnerID}, now, policy)
 	lifecycleForbid[chats.Persist](t, claim)
 	want := state
@@ -771,7 +811,7 @@ func TestSameOwnerClaimProtectsOwnerWithoutWriting(t *testing.T) {
 
 func TestProbeWithOnlyInMemoryMetadataChangesSkipsPersist(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
-	state, request := chats.BeginProbe(lifecycleState(chats.Active), chats.StartProbe{Trigger: chats.ProbeUnknown}, now)
+	state, request := chats.BeginProbe(lifecycleState(chats.Active), chats.StartProbe{Trigger: chats.ProbeUnknown}, now, 0)
 	result := lifecycleProbe(request, models.ChatMemberTypeAdministrator, chats.InviteUsers)
 	result.Admins.CreatorID = state.Record.OwnerID
 	result.Chat.JoinByRequest = true
@@ -782,47 +822,46 @@ func TestProbeWithOnlyInMemoryMetadataChangesSkipsPersist(t *testing.T) {
 	}
 }
 
-func TestEphemeralCompletionKeepsDowngradeProbeValid(t *testing.T) {
-	for _, class := range []telegram.Class{telegram.OK, telegram.Retry} {
-		t.Run(class.String(), func(t *testing.T) {
-			now, policy := lifecycleNow(), lifecyclePolicy()
-			admin := models.ChatMemberTypeAdministrator
-			join := lifecycleUpdate(1, models.ChatMemberTypeLeft, admin, chats.InviteUsers)
-			seq := uint64(0)
-			state := lifecycleCommit(chats.Step(lifecycleState(chats.NoRecord), join, now, policy), now, &seq)
-			confirmed := chats.Step(state, lifecycleProbe(state.Probe.InFlight, admin, chats.InviteUsers), now, policy)
-			message := lifecycleRequire[chats.OnboardingMessage](t, confirmed)
-			if !message.Ephemeral {
-				t.Fatalf("expected ephemeral onboarding: %+v", message)
-			}
+func TestProbeWithErasedCreatorStillAppliesChatFacts(t *testing.T) {
+	now, policy := lifecycleNow(), lifecyclePolicy()
+	policy.Language = "zh-Hans"
+	for _, initial := range []chats.ChatState{chats.NoRecord, chats.Removed, chats.Degraded} {
+		t.Run(string(initial), func(t *testing.T) {
+			state := lifecycleState(initial)
+			state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbeUnknown}, now, 42)
+			result := lifecycleProbe(request, models.ChatMemberTypeAdministrator, chats.InviteUsers)
+			result.SkipOwner = true
+			result.Chat.Title = "Current chat"
+			result.Chat.GuardAssigned, result.Chat.JoinByRequest = true, true
 
-			now = now.Add(time.Second)
-			downgrade := lifecycleUpdate(2, admin, admin, 0)
-			downgrade.Old.Rights = chats.InviteUsers
-			changed := chats.Step(confirmed.Next, downgrade, now, policy)
-			state, request := chats.BeginProbe(changed.Next, lifecycleRequire[chats.StartProbe](t, changed), now)
-			delivered := chats.Step(state, chats.OnboardingFinished{
-				MemberEpoch: message.MemberEpoch, ReceiverID: message.ReceiverID,
-				LanguageCode: message.Language.Actor, Result: lifecycleResult(class),
-			}, now.Add(time.Second), policy)
-			gone := sender.Result{Outcome: telegram.Outcome{Class: telegram.Done, Reason: telegram.ChatGone}}
-			finished := chats.Step(delivered.Next, chats.ProbeFinished{Request: request, Chat: chats.ProbeChat{Result: gone}}, now.Add(2*time.Second), policy)
-			if row := lifecycleRequire[chats.Persist](t, finished).Record; row.State != chats.Removed || row.RemovedReason != chats.RemovedChatGone {
-				t.Fatalf("downgrade Probe did not record that the chat is gone: %+v", row)
+			decision := chats.Step(state, result, now, policy)
+			row := lifecycleRequire[chats.Persist](t, decision).Record
+			recovered := initial != chats.Degraded
+			wantOwner := state.Record.OwnerID
+			if recovered {
+				wantOwner = 0
+			}
+			if row.OwnerID != wantOwner || row.State != chats.Active || row.Title != "Current chat" || decision.NewMemberEpoch != recovered {
+				t.Fatalf("Probe did not apply only the eligible facts: %+v", decision)
+			}
+			message, guided := lifecycleEffect[chats.OnboardingMessage](decision)
+			if guided != recovered || guided && (message.Language != (chats.LanguageCandidates{Group: "zh-Hans"}) ||
+				!message.GuardKnown || !message.GuardAssigned || !message.JoinByRequest || message.NeedsInviteUsers) {
+				t.Fatalf("unexpected guide after Probe: %+v", decision.Effects)
 			}
 		})
 	}
 }
 
-func TestPendingOnboardingUsesLatestAdderLanguage(t *testing.T) {
+func TestPendingOnboardingUsesLatestMembershipLanguage(t *testing.T) {
 	now, policy := lifecycleNow(), lifecyclePolicy()
 	state := lifecycleState(chats.Active)
 	seq := state.MemberEpoch
-	state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbeUnknown}, now)
+	state, request := chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbeUnknown}, now, 0)
 	admin := models.ChatMemberTypeAdministrator
 	first := lifecycleUpdate(1, models.ChatMemberTypeLeft, admin, chats.InviteUsers)
 	second := lifecycleUpdate(2, models.ChatMemberTypeLeft, admin, chats.InviteUsers)
-	second.FromID, second.LanguageCode = first.FromID+1, "en"
+	second.LanguageCode = "en"
 	for _, update := range []chats.MemberUpdate{first, second} {
 		now = now.Add(time.Second)
 		changed := chats.Step(state, update, now, policy)
@@ -833,12 +872,11 @@ func TestPendingOnboardingUsesLatestAdderLanguage(t *testing.T) {
 	completed := chats.Step(state, lifecycleProbe(request, admin, chats.InviteUsers), now, policy)
 	lifecycleForbid[chats.OnboardingMessage](t, completed)
 	pending := lifecycleRequire[chats.StartProbe](t, completed)
-	state, request = chats.BeginProbe(completed.Next, pending, now)
+	state, request = chats.BeginProbe(completed.Next, pending, now, 0)
 	finished := chats.Step(state, lifecycleProbe(request, admin, chats.InviteUsers), now, policy)
 	message := lifecycleRequire[chats.OnboardingMessage](t, finished)
-	if got := i18n.Resolve(message.Language.Group, message.Language.Actor); !message.Ephemeral || message.ReceiverID != second.FromID ||
-		message.Language.Actor != second.LanguageCode || got != "en" {
-		t.Fatalf("second adder did not receive an English ephemeral message: %+v resolved to %q", message, got)
+	if got := i18n.Resolve(message.Language.Group, message.Language.Actor); message.Language.Actor != second.LanguageCode || got != "en" {
+		t.Fatalf("onboarding did not use the latest membership language: %+v resolved to %q", message, got)
 	}
 }
 
@@ -863,7 +901,7 @@ func TestDowngradeLanguageCandidates(t *testing.T) {
 			var event chats.Event
 			if tc.fromProbe {
 				var request chats.ProbeRequest
-				state, request = chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbePermissionLost}, now)
+				state, request = chats.BeginProbe(state, chats.StartProbe{Trigger: chats.ProbePermissionLost}, now, 0)
 				event = lifecycleProbe(request, models.ChatMemberTypeAdministrator, 0)
 			} else {
 				update := lifecycleUpdate(1, models.ChatMemberTypeAdministrator, models.ChatMemberTypeAdministrator, 0)

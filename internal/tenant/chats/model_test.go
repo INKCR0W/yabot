@@ -26,7 +26,6 @@ type referenceChat struct {
 	claimCount       uint64
 	rights           chats.BotRights
 	hadAdmin         bool
-	adder            int64
 	chatType         models.ChatType
 	title            string
 	guardAssigned    bool
@@ -46,8 +45,9 @@ type referenceChat struct {
 	guideAfterRepeat bool
 	idleAfterProbe   bool
 	idleWaiting      bool
+	idleLeaveEpoch   uint64
+	idleLeaveVersion uint64
 	lastProbe        time.Time
-	lastGuide        time.Time
 	lastDowngrade    time.Time
 }
 
@@ -60,8 +60,8 @@ type modelSnapshot struct {
 	epoch         uint64
 	version       uint64
 	claimCount    uint64
-	addedBy       int64
 	addedAt       int64
+	purgeAfter    int64
 	chatType      models.ChatType
 	title         string
 	guardBot      bool
@@ -78,7 +78,7 @@ func (m referenceChat) snapshot() modelSnapshot {
 	return modelSnapshot{
 		status: m.status, rights: m.rights, hadAdmin: m.hadAdmin, watermark: m.watermark, owner: m.owner, epoch: m.epoch, version: m.version, claimCount: m.claimCount,
 		chatType: m.chatType, title: m.title, guardBot: m.guardAssigned, guardKnown: m.guardKnown,
-		joinByRequest: m.joinByRequest, migratedTo: m.migratedTo, addedBy: m.adder, addedAt: addedAt,
+		joinByRequest: m.joinByRequest, migratedTo: m.migratedTo, addedAt: addedAt, purgeAfter: m.purgeAfter,
 	}
 }
 
@@ -140,12 +140,12 @@ func (m *referenceChat) applyEvent(event chats.Event, now time.Time) ([]string, 
 			return nil, true
 		}
 		m.status, m.watermark, m.epoch, m.claimCount = chats.NoRecord, dispatch.Order{}, 0, 0
-		m.rights, m.owner, m.adder, m.hadAdmin = 0, 0, 0, false
+		m.rights, m.owner, m.hadAdmin = 0, 0, false
 		m.chatType, m.title, m.migratedTo, m.removedReason = "", "", 0, ""
 		m.guardKnown, m.guardAssigned, m.joinByRequest = false, false, false
 		m.addedAt, m.updatedAt, m.removedAt = time.Time{}, time.Time{}, time.Time{}
 		m.purgeAfter = 0
-		m.lastGuide, m.lastDowngrade = time.Time{}, time.Time{}
+		m.lastDowngrade = time.Time{}
 		m.repeatProbe, m.guideAfterRepeat = false, false
 		m.guideAfterProbe = false
 		m.idleAfterProbe, m.idleWaiting = false, false
@@ -200,16 +200,12 @@ func (m *referenceChat) memberUpdate(event chats.MemberUpdate, now time.Time) ([
 	wasOutside := event.Old.Status == models.ChatMemberTypeLeft || event.Old.Status == models.ChatMemberTypeBanned ||
 		event.Old.Status == models.ChatMemberTypeRestricted && !event.Old.IsMember
 	startsMembership := !hasReferenceMembership(previous) || wasOutside
-	guide := false
 	if startsMembership {
-		m.adder = 0
 		if wasOutside {
-			m.adder = event.FromID
 			m.addedAt = now
-			guide = true
 		}
 		m.owner = 0
-		m.guardKnown = false
+		m.guardKnown, m.guardAssigned, m.joinByRequest = false, false, false
 		m.migratedTo, m.removedAt, m.removedReason = 0, time.Time{}, ""
 		m.purgeAfter = 0
 		m.advanceEpoch()
@@ -217,9 +213,9 @@ func (m *referenceChat) memberUpdate(event chats.MemberUpdate, now time.Time) ([
 	if startsMembership || previous != incoming {
 		if m.request.Trigger != "" {
 			m.repeatProbe = true
-			m.guideAfterRepeat = guide || m.guideAfterRepeat && !startsMembership
+			m.guideAfterRepeat = m.guideAfterRepeat || startsMembership
 		} else {
-			m.offerProbe(chats.ProbeTransition, guide)
+			m.offerProbe(chats.ProbeTransition, startsMembership)
 			effects = append(effects, "probe")
 		}
 	}
@@ -264,6 +260,7 @@ func (m *referenceChat) completeProbe(event chats.ProbeFinished, now time.Time) 
 	effects := []string{"metric"}
 
 	current := m.version == event.Request.Version
+	discoversMembership := current && hasReferenceMembership(outcome) && !hasReferenceMembership(previous.status)
 	if !current {
 		effects = append(effects, "metric")
 	}
@@ -282,31 +279,30 @@ func (m *referenceChat) completeProbe(event chats.ProbeFinished, now time.Time) 
 		}
 	}
 	if current && hasReferenceMembership(outcome) {
-		if !hasReferenceMembership(m.status) {
+		if discoversMembership {
 			m.advanceEpoch()
-			m.adder = 0
 			m.addedAt = now
 			m.migratedTo, m.removedAt, m.removedReason = 0, time.Time{}, ""
 			m.purgeAfter = 0
-			m.owner = event.Admins.CreatorID
+			m.owner = 0
+			m.guardKnown, m.guardAssigned, m.joinByRequest = false, false, false
 		}
 		m.assignStatus(outcome, now)
 		m.rights = event.Member.Membership.Rights
 	}
-	if current {
-		m.guardKnown = false
-		if m.status != chats.NoRecord && event.Chat.Result.Outcome.Class == telegram.OK && event.Chat.Result.Dropped == 0 {
-			m.chatType, m.title = event.Chat.Type, event.Chat.Title
-			m.joinByRequest = event.Chat.JoinByRequest
-			if event.Member.Membership.Status == models.ChatMemberTypeAdministrator &&
-				event.Member.Result.Outcome.Class == telegram.OK && event.Member.Result.Dropped == 0 {
-				m.guardAssigned = event.Chat.GuardAssigned
-				m.guardKnown = true
-			}
+	chatRead := event.Chat.Result
+	if current && m.status != chats.NoRecord && chatRead.Outcome.Class == telegram.OK && chatRead.Dropped == 0 {
+		m.chatType, m.title, m.joinByRequest = event.Chat.Type, event.Chat.Title, event.Chat.JoinByRequest
+		memberRead := event.Member.Result
+		confirmedAdmin := memberRead.Dropped == 0 && memberRead.Outcome.Class == telegram.OK &&
+			event.Member.Membership.Status == models.ChatMemberTypeAdministrator
+		m.guardKnown = event.Chat.GuardVisible || confirmedAdmin
+		if m.guardKnown {
+			m.guardAssigned = event.Chat.GuardAssigned
 		}
 	}
-	if hasReferenceMembership(outcome) && hasReferenceMembership(m.status) &&
-		m.claimCount == event.Request.OwnerRevision && m.epoch == event.Request.MemberEpoch {
+	unchangedOwner := m.claimCount == event.Request.OwnerRevision && m.epoch == event.Request.MemberEpoch
+	if (discoversMembership || unchangedOwner && hasReferenceMembership(m.status) && hasReferenceMembership(outcome)) && !event.SkipOwner {
 		m.owner = event.Admins.CreatorID
 	}
 	if m.status != previous.status || m.owner != previous.owner || m.chatType != previous.chatType || m.title != previous.title ||
@@ -318,20 +314,16 @@ func (m *referenceChat) completeProbe(event chats.ProbeFinished, now time.Time) 
 	if current {
 		effects = m.downgrade(previous.status, now, effects)
 	}
-	if m.guideAfterProbe && m.epoch == event.Request.MemberEpoch &&
-		hasReferenceMembership(m.status) && m.adder != 0 && m.chatType != models.ChatTypeChannel {
-		if m.status == chats.Active || m.status == chats.Degraded {
-			effects = append(effects, "onboarding")
-		} else if m.lastGuide.IsZero() || !now.Before(m.lastGuide.Add(24*time.Hour)) {
-			m.lastGuide = now
-			effects = append(effects, "onboarding")
-		}
+	inMembershipThatRequestedGuide := m.guideAfterProbe && m.epoch == event.Request.MemberEpoch
+	if (discoversMembership || inMembershipThatRequestedGuide) && hasReferenceMembership(m.status) && m.chatType != models.ChatTypeChannel {
+		effects = append(effects, "onboarding")
 	}
 	if wasIdle {
 		if !current {
 			m.idleWaiting = true
 		} else if hasReferenceMembership(outcome) && (m.status == chats.Onboarding || m.status == chats.Degraded) &&
 			!m.hadAdmin && m.epoch == event.Request.MemberEpoch {
+			m.idleLeaveEpoch, m.idleLeaveVersion = m.epoch, m.version
 			effects = append(effects, "leave")
 		}
 	}
@@ -394,31 +386,35 @@ func (m *referenceChat) finishIdleLeave(event chats.LeaveFinished, now time.Time
 	if event.Source != chats.LeaveIdle {
 		panic(fmt.Sprintf("unsupported leave source %s", event.Source))
 	}
-	var effects []string
+	if m.status == chats.NoRecord || !event.Membership.Exists || event.Membership.Epoch != m.epoch {
+		return nil, true
+	}
+	confirmedIdleDeparture := m.status == chats.Removed && !m.hadAdmin
 	class := event.Result.Outcome.Class
 	left := event.Result.Dropped == 0 &&
 		(class == telegram.OK || class == telegram.Forbidden || class == telegram.Done || class == telegram.Migrated)
-	if !left {
-		effects = append(effects, "metric")
-	}
-	if m.status == chats.NoRecord || !event.Membership.Exists || event.Membership.Epoch != m.epoch {
-		return effects, true
-	}
-	if left {
-		if m.status == chats.Removed && m.purgeAfter == now.Unix() {
-			return effects, false
+	if !confirmedIdleDeparture {
+		if m.version != event.FactVersion || m.hadAdmin || (m.status != chats.Onboarding && m.status != chats.Degraded) {
+			return nil, true
 		}
-		if m.status != chats.Removed {
-			m.assignStatus(chats.Removed, now)
-			m.rights, m.removedAt, m.removedReason = 0, now, chats.RemovedByIdle
-			if class == telegram.Migrated {
-				m.migratedTo, m.removedReason = event.Result.Outcome.MigrateTo, chats.RemovedMigrated
-			}
+		if !left {
+			return []string{"metric"}, false
+		}
+	}
+	if m.status == chats.Removed {
+		if m.purgeAfter == now.Unix() {
+			return nil, false
 		}
 		m.purgeAfter = now.Unix()
-		effects = append(effects, "persist")
+		return []string{"persist"}, false
 	}
-	return effects, false
+	m.assignStatus(chats.Removed, now)
+	m.rights, m.removedAt, m.removedReason = 0, now, chats.RemovedByIdle
+	if class == telegram.Migrated {
+		m.migratedTo, m.removedReason = event.Result.Outcome.MigrateTo, chats.RemovedMigrated
+	}
+	m.purgeAfter = now.Unix()
+	return []string{"persist"}, false
 }
 
 func (m *referenceChat) downgrade(previous chats.ChatState, now time.Time, effects []string) []string {
@@ -490,7 +486,7 @@ func (e *modelEvents) next(m referenceChat, index int, now time.Time, chatType m
 		id := int64(index + 200 + e.random.IntN(51) - 25)
 		update := chats.MemberUpdate{
 			Order: dispatch.Order{Date: date, ID: id}, Type: chatType, Title: fmt.Sprintf("Update %d", index%5),
-			Old: e.member(), New: e.member(), FromID: int64(1 + e.random.IntN(10)),
+			Old: e.member(), New: e.member(),
 		}
 		e.updates = append(e.updates, update)
 		return update
@@ -506,7 +502,7 @@ func (e *modelEvents) next(m referenceChat, index int, now time.Time, chatType m
 	}
 	if draw < 87 && m.epoch != 0 {
 		return chats.LeaveFinished{Source: chats.LeaveIdle, Membership: chats.MembershipSnapshot{Exists: true, Epoch: m.epoch - 1},
-			Result: sender.Result{Outcome: telegram.Outcome{Class: telegram.OK}}}
+			FactVersion: m.version, Result: sender.Result{Outcome: telegram.Outcome{Class: telegram.OK}}}
 	}
 	triggers := []chats.ProbeTrigger{chats.ProbeUnknown, chats.ProbePermissionLost, chats.ProbeOwnerStale, chats.ProbeIdle}
 	return chats.ProbeTriggered{Trigger: triggers[e.random.IntN(len(triggers))]}
@@ -537,6 +533,7 @@ func (e *modelEvents) probeResult(request chats.ProbeRequest, chatType models.Ch
 		Member: chats.ProbeMember{Result: ok, Membership: e.member()},
 		Admins: chats.ProbeAdmins{Result: ok, CreatorID: int64(e.random.IntN(10))},
 	}
+	result.Chat.GuardVisible = result.Chat.GuardAssigned && e.random.IntN(2) == 0
 	if referenceMembershipStatus(result.Member.Membership) == chats.Removed {
 		result.Admins = chats.ProbeAdmins{}
 	}
@@ -567,6 +564,8 @@ func (e *modelEvents) probeResult(request chats.ProbeRequest, chatType models.Ch
 		result.Chat = chats.ProbeChat{Result: sender.Result{Outcome: telegram.Outcome{Class: telegram.Migrated, MigrateTo: -4}}}
 		result.Member = chats.ProbeMember{}
 		result.Admins = chats.ProbeAdmins{}
+	case 6, 7:
+		result.SkipOwner = result.Admins.CreatorID != 0
 	}
 	return result
 }
@@ -602,9 +601,11 @@ func modelEffectKinds(effects []chats.Effect) []string {
 }
 
 func TestLifecycleAgainstReferenceModel(t *testing.T) {
+	t.Parallel()
 	for _, chatType := range []models.ChatType{models.ChatTypeSupergroup, models.ChatTypeChannel} {
 		for _, seed := range []uint64{71, 306, 1279} {
 			t.Run(fmt.Sprintf("%s/%d", chatType, seed), func(t *testing.T) {
+				t.Parallel()
 				runReferenceSequence(t, chatType, seed, nil)
 				for _, scenario := range referenceScenarios() {
 					t.Run(scenario.name, func(t *testing.T) {
@@ -638,9 +639,8 @@ func referenceScenarios() []referenceScenario {
 	unknown := referenceTrigger(chats.ProbeUnknown)
 	idle := referenceTrigger(chats.ProbeIdle)
 	result := referenceCompletion(member)
-	leaveRetry := func(m referenceChat, _ time.Time, _ models.ChatType) chats.Event {
-		return chats.LeaveFinished{Source: chats.LeaveIdle, Membership: chats.MembershipSnapshot{Exists: true, Epoch: m.epoch}, Result: lifecycleResult(telegram.Retry)}
-	}
+	leaveRetry := referenceIdleLeave(telegram.Retry)
+	leaveOK := referenceIdleLeave(telegram.OK)
 	clear := func(m referenceChat, _ time.Time, _ models.ChatType) chats.Event {
 		return chats.ClearFinished{RemovedAt: m.removedAt.Unix(), MemberEpoch: m.epoch}
 	}
@@ -679,6 +679,31 @@ func referenceScenarios() []referenceScenario {
 			{nextProbe, idle},
 			{0, result},
 		}},
+		{"idle leave superseded by a newer watermark", []referenceStep{
+			{0, referenceMemberUpdate(1, left, member)},
+			{0, result},
+			{nextProbe, idle},
+			{0, result},
+			{0, referenceMemberUpdate(2, member, member)},
+			{0, leaveOK},
+		}},
+		{"idle leave with departure before an uncertain result", []referenceStep{
+			{0, referenceMemberUpdate(1, left, member)},
+			{0, result},
+			{nextProbe, idle},
+			{0, result},
+			{0, referenceMemberUpdate(2, member, left)},
+			{0, leaveRetry},
+		}},
+		{"idle leave with promotion and departure before the result", []referenceStep{
+			{0, referenceMemberUpdate(1, left, member)},
+			{0, result},
+			{nextProbe, idle},
+			{0, result},
+			{0, referenceMemberUpdate(2, member, admin)},
+			{0, referenceMemberUpdate(3, admin, left)},
+			{0, leaveOK},
+		}},
 		{"clear with pending completion", []referenceStep{
 			{0, referenceMemberUpdate(1, left, member)},
 			{0, result},
@@ -715,10 +740,19 @@ func referenceTrigger(trigger chats.ProbeTrigger) referenceEvent {
 	}
 }
 
+func referenceIdleLeave(outcome telegram.Class) referenceEvent {
+	return func(m referenceChat, _ time.Time, _ models.ChatType) chats.Event {
+		return chats.LeaveFinished{
+			Source: chats.LeaveIdle, Membership: chats.MembershipSnapshot{Exists: true, Epoch: m.idleLeaveEpoch},
+			FactVersion: m.idleLeaveVersion, Result: lifecycleResult(outcome),
+		}
+	}
+}
+
 func referenceMemberUpdate(id int64, old, new chats.Membership) referenceEvent {
 	return func(_ referenceChat, now time.Time, chatType models.ChatType) chats.Event {
 		return chats.MemberUpdate{
-			Order: dispatch.Order{Date: now.Unix(), ID: id}, Type: chatType, Title: "Member event", Old: old, New: new, FromID: 21,
+			Order: dispatch.Order{Date: now.Unix(), ID: id}, Type: chatType, Title: "Member event", Old: old, New: new,
 		}
 	}
 }
@@ -797,8 +831,14 @@ func runReferenceSequence(t *testing.T, chatType models.ChatType, seed uint64, p
 			current.MemberEpoch = commitSequence
 		}
 		for _, effect := range decision.Effects {
-			if intent, ok := effect.(chats.StartProbe); ok {
-				current, _ = chats.BeginProbe(current, intent, now)
+			switch effect := effect.(type) {
+			case chats.StartProbe:
+				current, _ = chats.BeginProbe(current, effect, now, 0)
+			case chats.LeaveChat:
+				if effect.Source == chats.LeaveIdle &&
+					(effect.Membership.Epoch != model.idleLeaveEpoch || !effect.Membership.Exists || effect.FactVersion != model.idleLeaveVersion) {
+					fail("idle leave has wrong epoch or facts: %+v", effect)
+				}
 			}
 		}
 		if current.Probe.InFlight != model.request || current.Probe.Actions.Idle != model.idleAfterProbe ||
@@ -815,7 +855,7 @@ func runReferenceSequence(t *testing.T, chatType models.ChatType, seed uint64, p
 			watermark: watermark, owner: current.Record.OwnerID, epoch: current.MemberEpoch,
 			version: current.Version, claimCount: current.OwnerRevision, chatType: current.Record.Type, title: current.Record.Title,
 			guardBot: current.Record.GuardAssigned, guardKnown: current.GuardKnown, joinByRequest: current.JoinByRequest,
-			migratedTo: current.Record.MigratedTo, addedBy: current.Record.AddedBy, addedAt: current.Record.AddedAt,
+			migratedTo: current.Record.MigratedTo, addedAt: current.Record.AddedAt, purgeAfter: current.Record.PurgeAfter,
 		}
 		if want := model.snapshot(); got != want {
 			fail("snapshot = %+v, want %+v", got, want)

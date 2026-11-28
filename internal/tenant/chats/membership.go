@@ -74,7 +74,7 @@ func MemberUpdateOf(update *models.Update) (MemberUpdate, bool) {
 	return MemberUpdate{
 		Order: order, Type: member.Chat.Type, Title: member.Chat.Title,
 		Old: MembershipOf(member.OldChatMember), New: MembershipOf(member.NewChatMember),
-		FromID: member.From.ID, LanguageCode: member.From.LanguageCode,
+		LanguageCode: member.From.LanguageCode,
 	}, true
 }
 
@@ -102,6 +102,11 @@ func (m Membership) state() (ChatState, RemovedReason) {
 }
 
 func (s *step) memberUpdate(event MemberUpdate) {
+	after, reason := event.New.state()
+	if after == NoRecord {
+		s.effects = append(s.effects, Metric{Kind: InvalidMember, Error: true})
+		return
+	}
 	record := &s.next.Record
 	watermark := record.Watermark
 	if record.State == NoRecord {
@@ -112,7 +117,7 @@ func (s *step) memberUpdate(event MemberUpdate) {
 		return
 	}
 
-	s.applyMembership(event)
+	s.applyMembership(event, after, reason)
 	if record.State == NoRecord {
 		s.next.MemoryWatermark = event.Order
 		s.effects = append([]Effect{UpdateWatermark{Order: event.Order}}, s.effects...)
@@ -121,7 +126,7 @@ func (s *step) memberUpdate(event MemberUpdate) {
 	record.Watermark = event.Order
 }
 
-func (s *step) applyMembership(event MemberUpdate) {
+func (s *step) applyMembership(event MemberUpdate, after ChatState, reason RemovedReason) {
 	record := &s.next.Record
 	before := record.State
 	if event.Old.Status == models.ChatMemberTypeAdministrator {
@@ -132,11 +137,6 @@ func (s *step) applyMembership(event MemberUpdate) {
 		}
 	}
 
-	after, reason := event.New.state()
-	if after == NoRecord {
-		s.effects = append(s.effects, Metric{Kind: InvalidMember, Error: true})
-		return
-	}
 	if after == Removed && before == NoRecord {
 		return
 	}
@@ -158,15 +158,10 @@ func (s *step) applyMembership(event MemberUpdate) {
 	oldState, _ := event.Old.state()
 	if !before.isPresent() || oldState == Removed {
 		s.enterMembership(after)
-		var actions FollowUp
 		if oldState == Removed {
-			record.AddedBy = event.FromID
 			record.AddedAt = s.now.Unix()
-			actions = FollowUp{Onboarding: true, LanguageCode: event.LanguageCode}
-		} else {
-			s.next.Probe.PendingActions = FollowUp{}
 		}
-		s.triggerProbe(ProbeTransition, actions)
+		s.triggerProbe(ProbeTransition, FollowUp{Onboarding: true, LanguageCode: event.LanguageCode})
 	} else if before != after {
 		s.setState(after)
 		s.triggerProbe(ProbeTransition, FollowUp{})
@@ -195,12 +190,13 @@ func (s *step) enterMembership(to ChatState) {
 	s.setState(to)
 	record := &s.next.Record
 	record.OwnerID = 0
-	record.AddedBy = 0
+	record.GuardAssigned = false
 	record.RemovedAt = 0
 	record.RemovedReason = ""
 	record.MigratedTo = 0
 	record.PurgeAfter = 0
 	s.next.GuardKnown = false
+	s.next.JoinByRequest = false
 	s.newEpoch = true
 }
 
@@ -242,6 +238,20 @@ func (s *step) setOwner(event OwnerSet) {
 }
 
 func (s *step) leaveFinished(event LeaveFinished) {
+	if event.Source == LeaveIdle {
+		if !s.sameMembership(event.Membership) {
+			s.stale = true
+			return
+		}
+		if s.next.Record.State == Removed && !s.next.Record.EverActive {
+			s.next.Record.PurgeAfter = s.now.Unix()
+			return
+		}
+		if event.FactVersion != s.next.Version || !s.next.Record.State.canLeaveIdle() || s.next.Record.EverActive {
+			s.stale = true
+			return
+		}
+	}
 	left := hasLeft(event.Result)
 	if !left {
 		s.effects = append(s.effects, Metric{
@@ -253,9 +263,7 @@ func (s *step) leaveFinished(event LeaveFinished) {
 	case LeavePurge:
 		s.finishPurge(event, left)
 	case LeaveIdle:
-		if !s.sameMembership(event.Membership) {
-			s.stale = true
-		} else if left {
+		if left {
 			s.expediteRemoval(event.Result.Outcome, RemovedByIdle)
 		}
 	}

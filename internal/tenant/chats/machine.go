@@ -57,7 +57,6 @@ type Record struct {
 	BotRights     BotRights
 	GuardAssigned bool
 	OwnerID       int64
-	AddedBy       int64
 	AddedAt       int64
 	UpdatedAt     int64
 	EverActive    bool
@@ -77,13 +76,12 @@ type State struct {
 	MemberEpoch      uint64
 	// Version tracks changes to chat facts outside Probe triggers and completions.
 	// Retain it with a recordless chat's memory watermark.
-	Version        uint64
-	OwnerRevision  uint64
-	Probe          ProbeState
-	JoinByRequest  bool
-	GuardKnown     bool
-	LastOnboarding time.Time
-	LastDowngrade  time.Time
+	Version       uint64
+	OwnerRevision uint64
+	Probe         ProbeState
+	JoinByRequest bool
+	GuardKnown    bool
+	LastDowngrade time.Time
 }
 
 func (s State) MembershipSnapshot() MembershipSnapshot {
@@ -131,11 +129,12 @@ type FollowUp struct {
 }
 
 type ProbeRequest struct {
-	Trigger       ProbeTrigger
-	Version       uint64
-	OwnerRevision uint64
-	MemberEpoch   uint64
-	StartedAt     time.Time
+	Trigger         ProbeTrigger
+	Version         uint64
+	OwnerRevision   uint64
+	MemberEpoch     uint64
+	ErasureSequence uint64
+	StartedAt       time.Time
 }
 
 // An empty InFlight.Trigger means no Probe is running.
@@ -185,7 +184,6 @@ type MemberUpdate struct {
 	Type         models.ChatType
 	Title        string
 	Old, New     Membership
-	FromID       int64
 	LanguageCode string
 }
 
@@ -197,6 +195,8 @@ type ProbeFinished struct {
 	Chat    ProbeChat
 	Member  ProbeMember
 	Admins  ProbeAdmins
+	// SkipOwner preserves the current owner when the returned identity crosses an erasure.
+	SkipOwner bool
 }
 
 type MigrationReported struct{ To int64 }
@@ -204,9 +204,10 @@ type MigrationReported struct{ To int64 }
 type OwnerSet struct{ UserID int64 }
 
 type LeaveFinished struct {
-	Source     LeaveSource
-	Membership MembershipSnapshot
-	Result     sender.Result
+	Source      LeaveSource
+	Membership  MembershipSnapshot
+	FactVersion uint64 // From the idle leave request.
+	Result      sender.Result
 }
 
 type ClearFinished struct {
@@ -214,22 +215,13 @@ type ClearFinished struct {
 	MemberEpoch uint64
 }
 
-// OnboardingFinished is the completion of an ephemeral message, including its fallback context.
-type OnboardingFinished struct {
-	MemberEpoch  uint64
-	ReceiverID   int64
-	LanguageCode string
-	Result       sender.Result
-}
-
-func (MemberUpdate) isEvent()       {}
-func (ProbeTriggered) isEvent()     {}
-func (ProbeFinished) isEvent()      {}
-func (MigrationReported) isEvent()  {}
-func (OwnerSet) isEvent()           {}
-func (LeaveFinished) isEvent()      {}
-func (ClearFinished) isEvent()      {}
-func (OnboardingFinished) isEvent() {}
+func (MemberUpdate) isEvent()      {}
+func (ProbeTriggered) isEvent()    {}
+func (ProbeFinished) isEvent()     {}
+func (MigrationReported) isEvent() {}
+func (OwnerSet) isEvent()          {}
+func (LeaveFinished) isEvent()     {}
+func (ClearFinished) isEvent()     {}
 
 type Effect interface{ isEffect() }
 
@@ -252,9 +244,6 @@ type LanguageCandidates struct {
 // Use OnboardingMessage.GuardAssigned only when GuardKnown is true.
 type OnboardingMessage struct {
 	Language         LanguageCandidates
-	ReceiverID       int64
-	MemberEpoch      uint64
-	Ephemeral        bool
 	GuardAssigned    bool
 	GuardKnown       bool
 	JoinByRequest    bool
@@ -264,10 +253,11 @@ type OnboardingMessage struct {
 type DowngradeMessage struct{ Language LanguageCandidates }
 
 type LeaveChat struct {
-	Source     LeaveSource
-	Membership MembershipSnapshot
-	Class      sender.Class
-	NoRetry    bool
+	Source      LeaveSource
+	Membership  MembershipSnapshot
+	FactVersion uint64 // Version verified by the idle Probe.
+	Class       sender.Class
+	NoRetry     bool
 }
 
 type ReplyOperation string
@@ -295,13 +285,12 @@ type Reply struct {
 type MetricKind string
 
 const (
-	ProbeOutcome      MetricKind = "probe_outcome"
-	ProbeInFlight     MetricKind = "probe_in_flight"
-	ProbeLimited      MetricKind = "probe_limited"
-	ProbeStaleResult  MetricKind = "probe_stale_result"
-	InvalidMember     MetricKind = "invalid_member"
-	LeaveOutcome      MetricKind = "leave_outcome"
-	OnboardingOutcome MetricKind = "onboarding_outcome"
+	ProbeOutcome     MetricKind = "probe_outcome"
+	ProbeInFlight    MetricKind = "probe_in_flight"
+	ProbeLimited     MetricKind = "probe_limited"
+	ProbeStaleResult MetricKind = "probe_stale_result"
+	InvalidMember    MetricKind = "invalid_member"
+	LeaveOutcome     MetricKind = "leave_outcome"
 )
 
 type Metric struct {
@@ -326,7 +315,7 @@ type Decision struct {
 	Next           State
 	Effects        []Effect
 	NewMemberEpoch bool
-	// Stale reports an ignored member update or leave, clear, or onboarding completion.
+	// Stale reports an ignored member update, leave completion, or clear completion.
 	// An ignored Probe completion is reported by a ProbeStaleResult metric instead.
 	// Any returned effects still apply.
 	Stale bool
@@ -352,8 +341,6 @@ func Step(state State, event Event, now time.Time, policy Policy) Decision {
 		s.leaveFinished(ev)
 	case ClearFinished:
 		s.clearFinished(ev)
-	case OnboardingFinished:
-		s.finishOnboarding(ev)
 	default:
 		panic("chats: unsupported event")
 	}
