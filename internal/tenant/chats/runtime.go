@@ -145,11 +145,6 @@ func (w *eventWork) answer(err error) {
 	}
 }
 
-func (w *eventWork) isPurge() bool {
-	event, ok := w.event.(LeaveFinished)
-	return ok && event.Source == LeavePurge
-}
-
 func (c *Chats) runEvent(ctx context.Context, sh *dispatch.Shard, k dispatch.Key, work *eventWork) {
 	if err := ctx.Err(); err != nil {
 		work.answer(err)
@@ -182,14 +177,14 @@ func (c *Chats) runEvent(ctx context.Context, sh *dispatch.Shard, k dispatch.Key
 	decision := Step(entity.state, event, now, c.policyFor(k.A))
 	if decision.Stale {
 		c.observeStale(k.A, work.event)
+		if _, clear := event.(ClearFinished); clear {
+			work.answer(ErrMembershipChanged)
+			return
+		}
 	}
 	if len(decision.Effects) != 0 {
 		switch effect := decision.Effects[0].(type) {
 		case Persist:
-			if work.isPurge() && entity.state.Record.State == Removed {
-				c.persist(ctx, sh, k, work, entity, decision, now, "expedite_purge", writePurgeAfter(k.A, effect.Record.PurgeAfter))
-				return
-			}
 			c.persist(ctx, sh, k, work, entity, decision, now, "upsert_chat", writeRecord(effect.Record))
 			return
 		case DeleteRecord:

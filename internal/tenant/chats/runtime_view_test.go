@@ -590,18 +590,20 @@ func TestRuntimeClearPublishesDeletionWithPinnedRecordlessMemory(t *testing.T) {
 			}})
 			h.apply(runtimeUpdate(chatID, 2, h.now().Unix(), models.ChatMemberTypeAdministrator, models.ChatMemberTypeLeft, false))
 			removed, version := h.snapshot(chatID), h.chats.Version()
+			h.advance(720 * time.Hour)
 			pinned := h.startReportedProbe(pinnedID)
+			var probe sender.Request
 			if tc.inFlight {
-				probe := h.startReportedProbe(chatID)
-				submitRuntimeClear(t, h, removed)
-				h.settleEffects(chatID)
+				probe = h.startReportedProbe(chatID)
+			}
+			if n, err := h.janitor["chats_purge"].run(t.Context()); err != nil || n != 1 {
+				t.Fatalf("sweep for chat %d with deadline %d deleted %d with %v", chatID, removed.PurgeAfter, n, err)
+			}
+			if tc.inFlight {
 				h.assertCounter(evictions, 0)
 				probe.Done(sender.DroppedResult(sender.Expired, sender.ErrWouldMiss))
 				h.settleEffects(chatID)
 				h.assertCounter(`yabot_chats_probe_total{trigger="report_unknown",outcome="expired"}`, 1)
-			} else {
-				submitRuntimeClear(t, h, removed)
-				h.settleEffects(chatID)
 			}
 			if got, ok := h.chats.State(chatID); ok {
 				t.Fatalf("clear left a snapshot: %+v", got)

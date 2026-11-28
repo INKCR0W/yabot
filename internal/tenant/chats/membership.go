@@ -321,7 +321,7 @@ func (s *step) expediteRemoval(outcome telegram.Outcome, reason RemovedReason) {
 
 func (s *step) clearFinished(event ClearFinished) {
 	record := s.next.Record
-	if record.State != Removed || record.RemovedAt != event.RemovedAt || s.next.MemberEpoch != event.MemberEpoch {
+	if !event.matchesRemoval(record.State, record.RemovedAt, s.next.MemberEpoch) {
 		s.stale = true
 		return
 	}
@@ -331,4 +331,8 @@ func (s *step) clearFinished(event ClearFinished) {
 		Probe: ProbeState{InFlight: probe.InFlight, LastStarted: probe.LastStarted},
 	}
 	s.effects = append(s.effects, DeleteRecord{ChatID: record.ChatID})
+}
+
+func (e ClearFinished) matchesRemoval(state ChatState, removedAt int64, memberEpoch uint64) bool {
+	return state == Removed && removedAt == e.RemovedAt && memberEpoch == e.MemberEpoch
 }

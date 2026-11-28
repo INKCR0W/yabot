@@ -15,6 +15,7 @@ const idleScanRows = 50
 type maintenance struct {
 	periodicAfter int64
 	idleAfter     idleCandidate
+	purgeCursor   *purgeCandidate
 	erasure       erasureGate
 	queued        sync.Map
 }

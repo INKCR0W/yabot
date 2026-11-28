@@ -116,10 +116,6 @@ func TestRuntimePurgeUsesMembershipAtVerdict(t *testing.T) {
 			if changed := initial.MemberEpoch != want.MemberEpoch; changed != tc.changed {
 				t.Fatalf("epoch %d → %d, want changed=%t", initial.MemberEpoch, want.MemberEpoch, tc.changed)
 			}
-			if want.State == Removed {
-				h.exec(`CREATE TRIGGER protect_removed_row BEFORE UPDATE OF removed_reason, owner_id ON chats
-					BEGIN SELECT raise(ABORT, 'unexpected change to the removed row'); END`)
-			}
 			h.advance(time.Minute)
 			leave.Done(sender.Result{Outcome: tc.outcome})
 			err := runtimeReceive(t, result)
@@ -599,22 +595,37 @@ func TestRuntimePurgeAbandonsRepeatedOperationErrors(t *testing.T) {
 
 func TestRuntimePurgeSettlesSynchronousSenderRejection(t *testing.T) {
 	t.Parallel()
-	const id = -100838
-	h := newRuntimeHarness(t, runtimeOptions{
-		tickets: 1,
-		beforeStart: func(h *runtimeHarness) {
-			h.seedActive(id, 1)
-			h.sender.reject = "leaveChat"
-		},
-	})
-	before := h.snapshot(id)
-	ctx, cancel := context.WithTimeout(t.Context(), runtimeWait)
-	defer cancel()
-	err := h.chats.Purge(ctx, id)
-	assertPurgeTelegramError(t, err, telegram.Outcome{Class: telegram.Retry})
-	h.assertCounter(`yabot_chats_effects_total{effect="leave_outcome",outcome="busy"}`, 1)
-	assertRuntimePurgeState(h, id, before, true)
-	h.assertProbeTicket(0)
+	for _, tc := range []struct {
+		name string
+		err  error
+		drop sender.DropReason
+	}{
+		{name: "busy", err: sender.ErrBusy, drop: sender.Busy},
+		{name: "closed", err: sender.ErrClosed, drop: sender.Shutdown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			const id = -100838
+			h := newRuntimeHarness(t, runtimeOptions{
+				tickets:     1,
+				beforeStart: func(h *runtimeHarness) { h.seedActive(id, 1) },
+				configure: func(d *Deps) {
+					d.Sender = purgeSenderFunc(func(sender.Request) error { return tc.err })
+				},
+			})
+			before := h.snapshot(id)
+			ctx, cancel := context.WithTimeout(t.Context(), runtimeWait)
+			defer cancel()
+			err := h.chats.Purge(ctx, id)
+			assertPurgeTelegramError(t, err, telegram.Outcome{Class: telegram.Retry})
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("Purge = %v, want cause %v", err, tc.err)
+			}
+			h.assertCounter(`yabot_chats_effects_total{effect="leave_outcome",outcome="`+tc.drop.String()+`"}`, 1)
+			assertRuntimePurgeState(h, id, before, true)
+			h.assertProbeTicket(0)
+		})
+	}
 }
 
 func TestRuntimePurgeExpeditesRemovedChatWhenSenderRejects(t *testing.T) {
@@ -646,8 +657,6 @@ func TestRuntimePurgeExpeditesRemovedChatWhenSenderRejects(t *testing.T) {
 			})
 		},
 	})
-	h.exec(`CREATE TRIGGER protect_removed_membership BEFORE UPDATE OF removed_at, removed_reason, owner_id ON chats
-		WHEN OLD.state = 'removed' BEGIN SELECT raise(ABORT, 'unexpected change to the removed row'); END`)
 	before := h.snapshot(id)
 	leftAt := h.now().Unix()
 	left := h.update(runtimeUpdate(id, 2, leftAt, models.ChatMemberTypeAdministrator, models.ChatMemberTypeLeft, false))

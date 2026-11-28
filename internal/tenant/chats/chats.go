@@ -75,6 +75,7 @@ type Deps struct {
 	Router           Router
 	Sender           Sender
 	Janitor          Janitor
+	Purgers          []contract.ChatPurger
 	Catalog          Catalog
 	Settings         *settings.Registry
 	Log              *slog.Logger
@@ -99,6 +100,7 @@ type Chats struct {
 	store         Store
 	dispatch      Dispatcher
 	sender        Sender
+	purgers       []contract.ChatPurger
 	catalog       Catalog
 	general       *settings.Handle[General]
 	log           *slog.Logger
@@ -163,7 +165,8 @@ func New(d Deps) (*Chats, error) {
 	}
 	c := &Chats{
 		store: d.Store, dispatch: d.Dispatcher, sender: d.Sender, catalog: d.Catalog,
-		log: d.Log, metrics: d.Metrics, now: d.Now, botID: d.BotID, botUsername: d.BotUsername,
+		purgers: append([]contract.ChatPurger(nil), d.Purgers...),
+		log:     d.Log, metrics: d.Metrics, now: d.Now, botID: d.BotID, botUsername: d.BotUsername,
 		policy:        Policy{AcceptNewChats: d.AcceptNewChats, RemovedRetention: removed, IdleLeaveAfter: idle},
 		probePeriodic: periodic,
 		periodicStart: periodicProbeGate{interval: time.Duration(interval)},
@@ -187,6 +190,7 @@ func New(d Deps) (*Chats, error) {
 	})
 	d.Janitor.Register("chats_probe", c.periodicStart.interval, c.periodicProbe)
 	d.Janitor.Register("chats_idle", time.Hour, c.idleSweep)
+	d.Janitor.Register("chats_purge", time.Minute, c.purgeSweep)
 	return c, nil
 }
 

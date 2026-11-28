@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -13,6 +14,57 @@ import (
 	"github.com/INKCR0W/yabot/internal/platform/sender"
 	"github.com/INKCR0W/yabot/internal/platform/telegram"
 )
+
+func TestRuntimePurgeCanceledInMailboxDoesNotEnqueueLeave(t *testing.T) {
+	t.Parallel()
+	const id = -100847
+	entryRan := make(chan struct{}, 1)
+	var watchEntry atomic.Bool
+	h := newRuntimeHarness(t, runtimeOptions{
+		beforeStart: func(h *runtimeHarness) { h.seedActive(id, 1) },
+		configure: func(d *Deps) {
+			actual := d.Dispatcher
+			d.Dispatcher = maintenanceDispatcher{Dispatcher: actual, submit: func(k dispatch.Key, task dispatch.Task) error {
+				if !watchEntry.Swap(false) {
+					return actual.Submit(k, task)
+				}
+				return actual.Submit(k, func(ctx context.Context, sh *dispatch.Shard) {
+					task(ctx, sh)
+					entryRan <- struct{}{}
+				})
+			}}
+		},
+	})
+	k := keyOf(id)
+	if err := h.dispatcher.Submit(k, func(_ context.Context, sh *dispatch.Shard) { sh.Hold(k) }); err != nil {
+		t.Fatal(err)
+	}
+	release := sync.OnceFunc(func() {
+		if err := h.dispatcher.Submit(k, func(_ context.Context, sh *dispatch.Shard) { sh.Release(k) }); err != nil {
+			t.Error(err)
+		}
+	})
+	defer release()
+	h.barrier(id)
+	before := h.snapshot(id)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	watchEntry.Store(true)
+	go func() { result <- h.chats.Purge(ctx, id) }()
+	runtimeReceive(t, entryRan)
+	h.assertNoRequest()
+	cancel()
+	if err := runtimeReceive(t, result); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Purge returned %v, want context.Canceled", err)
+	}
+	release()
+	h.settleEffects(id)
+	h.assertNoRequest()
+	h.assertProbeTicket(0)
+	assertRuntimePurgeState(h, id, before, true)
+}
 
 func TestRuntimePurgeSkipsLeaveWhenRejoinedBeforeAdmission(t *testing.T) {
 	t.Parallel()
